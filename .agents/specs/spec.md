@@ -1,5 +1,10 @@
-# Spec — cap: the coordinator's watcher and advisor
+<!-- specs:locked:2748f7c 2026-11-07 type=spec -->
 
+## Link contract
+- **upstream** (this doc relies on): none
+- **referrers** (must cite this when they change): .agents/specs/
+
+# Spec — cap: the coordinator's watcher and advisor
 Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 
 ## Problem & who breaks
