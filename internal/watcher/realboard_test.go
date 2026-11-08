@@ -9,10 +9,11 @@ import (
 	"testing"
 
 	"github.com/IanLuo/cap/internal/board"
-	"github.com/IanLuo/cap/internal/state"
+	"github.com/IanLuo/memstore"
 )
 
-// AC6 against the real fs client. The fake fs logs its argv, and the test
+// AC6 against the real board client. The fake fs is a shell stub that logs its
+// argv; it is not the real fs binary. The test
 // asserts that across a tick and an act every call was `fs status`: no add,
 // claim, report, or done. The board answer is also identical before and after.
 func TestAC6OnlyStatusReachesFS(t *testing.T) {
@@ -62,13 +63,26 @@ JSON
 		}
 	}
 
-	rows, err := s.Recent(state.Scope("p"), 1000)
+	// The fs scope is fs's own. Count its rows through a second handle before
+	// and after cap ran: cap must add none. Reading cap's own scope would prove
+	// nothing, because fs rows never live there.
+	if n := rowsInScope(t, path, "fs:p"); n != 0 {
+		t.Fatalf("cap left %d rows in fs:p; fs rows must be untouched", n)
+	}
+}
+
+// rowsInScope counts live rows in one scope through its own memstore handle,
+// so the count does not depend on cap's state layer.
+func rowsInScope(t *testing.T, path, scope string) int {
+	t.Helper()
+	db, err := memstore.Open(path)
 	if err != nil {
-		t.Fatalf("read cap rows: %v", err)
+		t.Fatalf("open store to count %s: %v", scope, err)
 	}
-	for _, r := range rows {
-		if strings.HasPrefix(r.Kind, "fs.") {
-			t.Fatalf("cap wrote an fs row: %s", r.Kind)
-		}
+	defer db.Close()
+	mems, err := db.Recent(scope, 1<<20)
+	if err != nil {
+		t.Fatalf("count %s: %v", scope, err)
 	}
+	return len(mems)
 }
