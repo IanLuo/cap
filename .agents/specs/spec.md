@@ -1,4 +1,4 @@
-<!-- specs:locked:2748f7c 2026-11-07 type=spec -->
+<!-- specs:locked:3288d38 2026-11-08 type=spec -->
 
 ## Link contract
 - **upstream** (this doc relies on): none
@@ -67,7 +67,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **AC10 · Fail closed.** Given an unreadable board or store, then the tick exits non-zero, names the cause, and launches nothing.
 - **AC11 · The watcher is supervised.** Given the module is enabled, when `cap watch` exits, then launchd restarts it, and only one watcher runs.
 - **AC12 · The interface controls only the watcher.** Given `cap status`, `cap start`, `cap stop`, or `cap logs`, then no task command runs, fs is unchanged, no knowledge is edited, and start and stop act on cap's own label alone.
-- **AC13 · Every verb is machine-readable.** Given `--json`, then the verb prints exactly one JSON object on stdout; exit is 0 on success, 1 on failure, 2 on usage.
+- **AC13 · Every verb is machine-readable.** Given `--json`, then the verb prints JSON on stdout — one object per call, one per tick for `watch` — and exits 0 on success, 1 on failure, 2 on usage.
 
 ## KPIs & failure signal
 
