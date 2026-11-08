@@ -28,6 +28,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **An instruction.** The user names a task. cap resolves the command from knowledge, launches it detached, returns, and records one `cap.act`.
 - **A confirmation.** A later tick that sees a holder updates the record. A dispatch that did not take is reported, not retried.
 - **An ask.** Knowledge missing or ambiguous produces one `cap.question` and no command. cap never guesses.
+- **A supervisor and an operator interface.** `cap watch` runs under launchd with KeepAlive. `cap status`, `cap start`, `cap stop` and `cap logs` let an agent see and control the watcher, each with `--json`. `cap status` and `cap logs` may read the trace; no decision does. None of them launches a task command.
 - **Two forms, one boundary.** The watcher is a standalone no-AI process. An on-demand coding-agent interface reads its report and discusses choices. The agent never runs on a clock; the watcher never calls a model.
 
 **Out — and what keeps it out**
@@ -37,6 +38,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **Not an fs writer.** No task, no report, no claim, no review task. *Kept out by:* fs refuses every task write without a held claim, and cap never claims.
 - **Not autonomous.** Nothing launches without a named instruction. *Kept out by:* the tick path has no command launcher.
 - **Not a store.** No database, no queue, no copy of the evidence. *Kept out by:* three kinds of state record in memstore and a local trace log.
+- **Not a supervisor of workers.** launchd supervises cap; cap supervises nothing else. *Kept out by:* start and stop act on cap's own launchd label, and no worker pid, pane or lease is read.
 - **Not a scheduler with priorities.** No backlog, no memory between ticks except the cursor. *Kept out by:* a fixed rank and one act per instruction.
 - **Not an author.** No task cards, no specs, no tools, no knowledge edits. *Kept out by:* the ask.
 - **Not a reviewer.** The user and the agent judge the board; fs's `done` gate judges the work.
@@ -63,6 +65,9 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **AC8 · The instruction gate.** Given an instruction for a task launched less than 90 s ago, then nothing is launched, and the refusal names the earlier launch.
 - **AC9 · Zero tokens on the clock.** Given a day of ticks, then no model call was made by the watcher, and the report is text.
 - **AC10 · Fail closed.** Given an unreadable board or store, then the tick exits non-zero, names the cause, and launches nothing.
+- **AC11 · The watcher is supervised.** Given the module is enabled, when `cap watch` exits, then launchd restarts it, and only one watcher runs.
+- **AC12 · The interface controls only the watcher.** Given `cap status`, `cap start`, `cap stop`, or `cap logs`, then no task command runs, fs is unchanged, no knowledge is edited, and start and stop act on cap's own label alone.
+- **AC13 · Every verb is machine-readable.** Given `--json`, then the verb prints exactly one JSON object on stdout; exit is 0 on success, 1 on failure, 2 on usage.
 
 ## KPIs & failure signal
 
@@ -78,7 +83,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **N3 · One board read, no reading of work.** One `fs status` per tick. cap never runs `agent read`, never reads a pane, a diff, or a transcript.
 - **N4 · Bounded state.** One open record per task and per gap; the cursor is written only when the board changes. Ten times worse would turn memstore into a tick log and degrade every other project that shares the file.
 - **N5 · Fail closed.** Unreadable board, store, or command means no act, no act record, and a non-zero exit naming the cause.
-- **N6 · One watcher at a time, by convention.** A second watcher is safe but redundant; no lock is kept, and fs's claim is what arbitrates a duplicated launch.
+- **N6 · One watcher at a time, by convention.** launchd holds one `cap watch`; a start on a loaded agent does not add a second. A second watcher is otherwise safe but redundant; no lock is kept, and fs's claim is what arbitrates a duplicated launch.
 
 ## Assumptions & dependencies
 
@@ -137,6 +142,10 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 | AC8 the instruction gate | two instructions inside 90 s: one launch, the second refused with the earlier time. |
 | AC9 zero tokens | the watcher path has no model client; a test asserts no call over a simulated day. |
 | AC10 fail closed | an unreadable store: non-zero exit, no launch, no record. |
+| AC11 watcher supervised | nix eval of the module: one agent, KeepAlive, ProgramArguments `cap watch`; fake launchctl in the CLI tests. |
+| AC12 interface touches nothing | fake fs and a temp store: every verb run, no task command, no fs argv, no knowledge write. |
+| AC13 JSON verbs | one JSON object per verb with `--json`; exit 0/1/2. |
+| N6 one watcher | fake launchctl: start on a loaded agent issues kickstart, not bootstrap; stop issues one bootout. |
 | N1 clock | time a tick against a slow board fixture. |
 | N3 no reading of work | the fake harness records every call; no `agent read` and no `pane read`. |
 | N4 bounded state | row count after ten unchanged ticks stays flat. |
@@ -144,4 +153,4 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 | independent check | one review task, in a session that did not write cap, reads this locked doc against the change and asks: can cap act without writing in fs, and can anything launch without an instruction. |
 | manual, once | one tick on the real board with a real unheld task, observed in fs and in the pane list. |
 
-Last reviewed: 2026-11-07 · cap
+Last reviewed: 2026-11-08 · cap
