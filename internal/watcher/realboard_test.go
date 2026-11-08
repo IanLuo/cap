@@ -37,6 +37,12 @@ JSON
 
 	s, path := newStorePath(t)
 	seedKnowledge(t, path, "cap.dispatch: echo {task}\ncap.agent: fake")
+
+	// The fs scope is fs's own. Count its rows through a second handle before
+	// and after cap ran: cap must add none. Reading cap's own scope would prove
+	// nothing, because fs rows never live there.
+	beforeRows := rowsInScope(t, path, "fs:p")
+
 	c := newClock("2026-11-08T12:00:00Z")
 	if _, err := testWatcher(client, s, c).Tick(context.Background()); err != nil {
 		t.Fatalf("tick: %v", err)
@@ -63,11 +69,9 @@ JSON
 		}
 	}
 
-	// The fs scope is fs's own. Count its rows through a second handle before
-	// and after cap ran: cap must add none. Reading cap's own scope would prove
-	// nothing, because fs rows never live there.
-	if n := rowsInScope(t, path, "fs:p"); n != 0 {
-		t.Fatalf("cap left %d rows in fs:p; fs rows must be untouched", n)
+	// The count is unchanged, so cap added no fs rows.
+	if afterRows := rowsInScope(t, path, "fs:p"); afterRows != beforeRows {
+		t.Fatalf("cap changed fs:p rows from %d to %d; fs rows must be untouched", beforeRows, afterRows)
 	}
 }
 
