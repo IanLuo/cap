@@ -31,5 +31,57 @@
       devShells = eachSystem (pkgs: {
         default = pkgs.mkShell { packages = [ pkgs.go_1_27 pkgs.gopls ]; };
       });
+
+      # The watcher's supervisor. Import this from a home-manager config; the
+      # module owns one launchd agent and nothing else. `fs` is resolved from
+      # the profile PATH unless fsPackage names a package, so the flake does not
+      # depend on another repo's flake.
+      homeManagerModules.default = { config, lib, pkgs, ... }:
+        let
+          cfg = config.programs.cap;
+          system = pkgs.stdenv.hostPlatform.system;
+        in {
+          options.programs.cap = {
+            enable = lib.mkEnableOption "the cap watcher under launchd";
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${system}.default;
+              description = "The cap package to run.";
+            };
+            fsPackage = lib.mkOption {
+              type = lib.types.nullOr lib.types.package;
+              default = null;
+              description = "Package providing fs; null uses the profile PATH.";
+            };
+            trace = lib.mkOption {
+              type = lib.types.str;
+              default = "${config.home.homeDirectory}/.cap/trace.log";
+              description = "Where the watcher writes its trace.";
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            home.packages = [ cfg.package ];
+
+            launchd.agents.cap = {
+              enable = true;
+              config = {
+                Label = "home-manager.cap";
+                ProgramArguments = [ "${cfg.package}/bin/cap" "watch" ];
+                KeepAlive = true;
+                EnvironmentVariables = {
+                  CAP_TRACE = cfg.trace;
+                  PATH = lib.concatStringsSep ":" (
+                    [ "${config.home.profileDirectory}/bin" ]
+                    ++ lib.optionals (cfg.fsPackage != null) [ "${cfg.fsPackage}/bin" ]
+                    ++ [ "/run/current-system/sw/bin" "/usr/bin" "/bin" "/usr/sbin" "/sbin" ]
+                  );
+                };
+                StandardOutPath = "${config.home.homeDirectory}/Library/Logs/cap.out.log";
+                StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/cap.err.log";
+              };
+            };
+          };
+        };
     };
 }

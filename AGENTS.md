@@ -23,6 +23,10 @@ nix build .
 ./result/bin/cap tick
 ./result/bin/cap watch          # 30 s clock, no model, no launcher
 ./result/bin/cap act <task-id>  # one instruction
+./result/bin/cap status         # running, pid, last tick, last error
+./result/bin/cap start          # start cap's launchd label
+./result/bin/cap stop           # stop cap's launchd label
+./result/bin/cap logs --tail 20 # the operator view of the trace
 ```
 
 - Tests use a temporary memstore file plus fake board and launcher. They need no herdr, no network, and never touch the real board.
@@ -41,7 +45,9 @@ nix build .
 - **Fail closed.** Unreadable board, store, or command means non-zero exit, no open act record, no launch. No fallback store, no retry.
 - **Rank:** unheld review before unheld dev; then fs's oldest-first task order (preserved as the board returns it). A task with an unconfirmed act younger than 90 s is skipped.
 - **Knowledge is never edited by cap.** A dispatch record must name exactly one `cap.dispatch:` command. Zero candidates or two distinct commands raises exactly one question and launches nothing.
-- **The trace is a file, not a store.** One JSON line per tick and per act, rotated at 1 MiB. cap never reads it, and it never gates a decision.
+- **The trace is a file, not a store.** One JSON line per tick and per act, rotated at 1 MiB. `cap status` and `cap logs` read it for the operator; no decision does, and it never gates a decision.
+- **The interface controls one label.** `status`, `start`, `stop` and `logs` act on `home-manager.cap` only. They never launch a task command, never read fs, and never touch the store. `start` leaves a running watcher running; `stop` bootouts the label.
+- **One watcher.** The nix module (`homeManagerModules.default`) runs `cap watch` under launchd with KeepAlive. Do not add a second supervisor or a second label.
 
 ## Knowledge record format
 
@@ -58,11 +64,12 @@ Placeholders: `{task}`, `{project}`, `{path}`, `{kind}`. `cap.agent` names the a
 ## Architecture elevator
 
 ```text
-cmd/cap/          CLI: tick, watch, act; env wiring; exit codes
+cmd/cap/          CLI: tick, watch, act, status, start, stop, logs; env wiring; exit codes
 internal/board/   one fs status read, JSON envelope, Task type
 internal/state/   the three cap record kinds; the only memstore importer
 internal/watcher/ tick (no launcher), act (one launcher), rank, knowledge, report
 internal/launch/  detached sh -c in the project directory; knows nothing about herdr
+internal/service/ one launchd label: status, start, stop; knows nothing about tasks
 internal/trace/   one JSON line per tick and act; rotates; never gates
 vendor/           memstore + pure-Go sqlite, committed for hermetic builds
 ```
