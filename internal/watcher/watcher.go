@@ -17,8 +17,11 @@ const (
 	// DefaultInterval is the watcher clock.
 	DefaultInterval = 30 * time.Second
 
-	rowLimit       = 1 << 14
-	cursorLimit    = 256
+	// rowLimit and cursorLimit bound one memstore listing. A listing that is
+	// too short can hide the open record behind closed history, so both match
+	// fs's listing bound (1<<20), not a guess at today's volume.
+	rowLimit       = 1 << 20
+	cursorLimit    = 1 << 20
 	knowledgeLimit = 256
 )
 
