@@ -39,6 +39,18 @@ type Recommendation struct {
 	Earlier   string
 }
 
+// ShortCommand is the one-line form a report shows. The full text stays in
+// `--json` and in the cap.act record; the default view keeps the command
+// recognizable without pasting a page of shell.
+func ShortCommand(s string) string {
+	s = oneLine(s)
+	const max = 80
+	if len(s) <= max {
+		return s
+	}
+	return strings.TrimSpace(s[:max-1]) + "…"
+}
+
 // String renders the report as plain text. A tick with no board change and no
 // pending act returns an empty string: nothing is reported.
 func (r Report) String() string {
@@ -52,10 +64,12 @@ func (r Report) String() string {
 			b.WriteString("recommendations: none\n")
 		} else {
 			b.WriteString("recommendations:\n")
+			anyCommand := false
 			for _, rec := range r.Recommendations {
 				fmt.Fprintf(&b, "  %s %s %s | %s", rec.Task.Task, rec.Task.Project, rec.Task.Kind, rec.Reason)
 				if rec.Command != "" {
-					fmt.Fprintf(&b, " | command: %s", oneLine(rec.Command))
+					fmt.Fprintf(&b, " | command: %s", ShortCommand(rec.Command))
+					anyCommand = true
 				}
 				if rec.Gap != "" {
 					fmt.Fprintf(&b, " | no command: %s", rec.Gap)
@@ -64,6 +78,9 @@ func (r Report) String() string {
 					fmt.Fprintf(&b, " | earlier: %s", rec.Earlier)
 				}
 				b.WriteString("\n")
+			}
+			if anyCommand {
+				b.WriteString("  (full commands: cap tick --json)\n")
 			}
 		}
 	}

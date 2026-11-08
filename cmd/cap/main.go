@@ -200,7 +200,7 @@ func actCmd(tid string, o options, stdout, stderr io.Writer) int {
 			Agent: result.Agent, Launched: result.Launched,
 		})
 	}
-	fmt.Fprintf(stdout, "launched %s for %s (knowledge %s, agent %s)\n", result.Command, result.Task, result.Knowledge, result.Agent)
+	fmt.Fprintf(stdout, "launched %s for %s (knowledge %s, agent %s)\n", watcher.ShortCommand(result.Command), result.Task, result.Knowledge, result.Agent)
 	return 0
 }
 
