@@ -30,12 +30,19 @@ func (w *Watcher) recommend(tasks []board.Task, rows []state.Row, now time.Time)
 	type candidate struct {
 		task board.Task
 	}
+	byTask := make(map[string]board.Task, len(tasks))
+	for _, t := range tasks {
+		byTask[t.Task] = t
+	}
 	var actable []candidate
 	for _, t := range tasks {
 		if t.State != "open" {
 			continue
 		}
 		if gated(all[t.Task], now, w.gate()) {
+			continue
+		}
+		if t.Kind == "review" && awaitingFix(t, byTask) {
 			continue
 		}
 		actable = append(actable, candidate{task: t})
@@ -68,6 +75,29 @@ func (w *Watcher) recommend(tasks []board.Task, rows []state.Row, now time.Time)
 		out = append(out, rec)
 	}
 	return out, nil
+}
+
+// awaitingFix reports whether a review's newest verdict is fail or blocked and
+// its parent dev task has no newer dev-done. A newer dev-done is a fix: the
+// review is actable again. No parent dev means cap cannot prove a fix is owed,
+// so the review stays recommended.
+func awaitingFix(review board.Task, byTask map[string]board.Task) bool {
+	v := review.Agent
+	if v.Role != "review" || v.At == nil || (v.Reported != "fail" && v.Reported != "blocked") {
+		return false
+	}
+	dev, ok := byTask[review.ParentDev]
+	if review.ParentDev == "" || !ok {
+		return false
+	}
+	if dev.State == "done" {
+		return true
+	}
+	d := dev.Agent
+	if d.Reported != "dev-done" || d.At == nil {
+		return true
+	}
+	return !d.At.After(*v.At)
 }
 
 func kindRank(kind string) int {
