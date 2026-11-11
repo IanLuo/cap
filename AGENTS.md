@@ -51,12 +51,13 @@ nix build .
 
 ## Knowledge record format
 
-A kind `knowledge` memory with marker lines. `cap.task-kind` is optional; absent means every kind.
+A kind `knowledge` memory with marker lines. `cap.task-kind` and `cap.project` are optional; absent means every kind or every project. `cap.project` takes one or more comma-separated project names.
 
 ```text
 cap.dispatch: herdr start --task {task}
 cap.agent: herdr
 cap.task-kind: dev
+cap.project: cap
 ```
 
 Placeholders: `{task}`, `{project}`, `{path}`, `{kind}`. `cap.agent` names the agent kind recorded on `cap.act`; absent records `unspecified`.

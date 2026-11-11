@@ -48,7 +48,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 1. Every 30 s: one `fs status` over every project.
 2. Compare with `cap.cursor`. A task is *changed* when its hold state, its lease, or its newest report differs from the last snapshot. No change: nothing is written and nothing is reported.
 3. Report the changes, then the task(s) cap would work on next, by rank.
-4. The user names a task. cap searches memstore for kind `knowledge` describing how to dispatch that kind of work.
+4. The user names a task. cap searches memstore for kind `knowledge` describing how to dispatch that kind of work in that project.
 5. A command is found: launch it detached in the task's project, write one `cap.act`, return. No command, or two candidates: write one `cap.question`, launch nothing.
 6. The next tick reports whether a holder appeared and updates the record. No auto-retry.
 7. cap holds nothing: no claim, no lease, no pane it reads.
@@ -59,6 +59,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **AC2 · One record per event.** Given a changed board, when a tick runs, then at most one open `cap.cursor` exists, replaced only on change. Given one instruction, then exactly one `cap.act` exists for it.
 - **AC3 · A stranger reconstructs the act.** Given the task id, a reader combines the fs row (holder, lease, last report) with the `cap.act` record (command, agent kind, knowledge id, time, observed result) and knows what happened. Neither source repeats the other.
 - **AC4 · Confirmed means held.** Given a launch, when a later tick shows a holder, then the record is confirmed. When no holder appears, then the record stays unconfirmed and the report names it. cap never marks a task failed.
+- **AC4a · A recipe is scoped to the projects it names.** Given a knowledge record with `cap.project:`, then it matches only tasks whose project is listed. Given no `cap.project:` marker, it matches every project. A task whose project no record names gets one `cap.question` and no command.
 - **AC5 · Missing knowledge asks.** Given no knowledge record names a command for the act, when the user instructs the task, then one `cap.question` is written, no command is launched, fs is unchanged, and a second instruction for the same gap opens no second question.
 - **AC6 · cap writes nothing in fs.** Given any tick or act, then fs holds no new task, report, claim or review task from cap, and cap never appears as a holder. The smallest refusal: any attempt by cap to write there.
 - **AC7 · The rank holds.** Given one unheld review and one unheld dev task, the recommendation names the review first. Given dev tasks only, the oldest. A task with an unconfirmed act younger than 90 s is not recommended again.
@@ -136,6 +137,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 | AC2 one record per event | row counts after a changed tick and after one instruction. |
 | AC3 a stranger reconstructs | a fresh session reads one `cap.act` and the fs row and names command, knowledge id, outcome. |
 | AC4 confirmed means held | fake launcher that claims late, then never: confirmed on a later tick, then reported unconfirmed. |
+| AC4a recipe is project-scoped | two records, one scoped to a and one unscoped: a task in b matches only the unscoped one; a task in c with only the scoped record asks. |
 | AC5 missing knowledge asks | no knowledge: one question, no command, fs unchanged, no second question. |
 | AC6 cap writes nothing in fs | `fs status` before and after: identical; no claim row from cap. |
 | AC7 the rank holds | one review and one dev unheld: review first; dev only: oldest; unconfirmed act inside the gate: not recommended. |
