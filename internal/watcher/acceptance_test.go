@@ -215,6 +215,55 @@ func TestAC4aScopedRecordDoesNotMatchAnotherProject(t *testing.T) {
 	}
 }
 
+// AC4b: a review inherits its parent dev task's path. fs records the path on
+// the dev task, not on the review.
+func TestAC4bReviewInheritsParentPath(t *testing.T) {
+	b := &fakeBoard{tasks: []board.Task{
+		{Task: "t-dev", Project: "p", Kind: "dev", State: "done", ProjectPath: "/tmp/p"},
+		{Task: "t-rev", Project: "p", Kind: "review", State: "open", ParentDev: "t-dev"},
+	}}
+	s, path := newStorePath(t)
+	c := newClock("2026-11-07T12:00:00Z")
+	seedKnowledge(t, path, "cap.dispatch: echo {task} in {path}\ncap.agent: fake\ncap.task-kind: review")
+	l := &fakeLauncher{}
+	d := testDispatcher(b, s, l, c)
+
+	if _, err := d.Act(ctx(), "t-rev"); err != nil {
+		t.Fatalf("act on a review with no path: %v", err)
+	}
+	if len(l.calls) != 1 {
+		t.Fatalf("launches = %d, want 1", len(l.calls))
+	}
+	if l.calls[0].Dir != "/tmp/p" {
+		t.Fatalf("launched in %q, want the parent's path", l.calls[0].Dir)
+	}
+	if n := countOpen(t, s, state.Scope("p"), state.KindQuestion); n != 0 {
+		t.Fatalf("questions = %d, want 0", n)
+	}
+}
+
+// AC4b: with no path anywhere, cap still asks and launches nothing.
+func TestAC4bNoPathAnywhereAsks(t *testing.T) {
+	b := &fakeBoard{tasks: []board.Task{
+		{Task: "t-rev", Project: "p", Kind: "review", State: "open", ParentDev: "t-missing"},
+	}}
+	s, path := newStorePath(t)
+	c := newClock("2026-11-07T12:00:00Z")
+	seedKnowledge(t, path, "cap.dispatch: echo {task}\ncap.agent: fake\ncap.task-kind: review")
+	l := &fakeLauncher{}
+	d := testDispatcher(b, s, l, c)
+
+	if _, err := d.Act(ctx(), "t-rev"); err == nil || !IsRefusal(err) {
+		t.Fatalf("act with no path = %v, want refusal", err)
+	}
+	if len(l.calls) != 0 {
+		t.Fatalf("launches = %d, want 0", len(l.calls))
+	}
+	if n := countOpen(t, s, state.Scope("p"), state.KindQuestion); n != 1 {
+		t.Fatalf("questions = %d, want 1", n)
+	}
+}
+
 // AC5: missing knowledge asks once. One question, no command, fs unchanged, and
 // a second instruction for the same gap opens no second question.
 func TestAC5MissingKnowledgeAsksOnce(t *testing.T) {

@@ -81,6 +81,17 @@ func (d *Dispatcher) Act(ctx context.Context, tid string) (ActResult, error) {
 	if err != nil {
 		return ActResult{}, err
 	}
+	// A review task carries no project_path of its own; fs records it on the
+	// dev task it reviews. Inherit that path so a review can be dispatched.
+	// With neither, there is no working directory to launch in.
+	if task.ProjectPath == "" && task.ParentDev != "" {
+		for _, t := range tasks {
+			if t.Task == task.ParentDev && t.Project == task.Project {
+				task.ProjectPath = t.ProjectPath
+				break
+			}
+		}
+	}
 	if task.ProjectPath == "" {
 		return d.ask(task, "task has no project_path; dispatch needs a working directory", questions, now)
 	}
