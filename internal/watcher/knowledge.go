@@ -14,9 +14,12 @@ import (
 //	cap.dispatch: herdr start --task {task}
 //	cap.agent: herdr
 //	cap.task-kind: dev
+//	cap.project: cap, balcony
 //
-// cap.task-kind is optional; absent means the record applies to every kind.
-// Placeholders {task}, {project}, {path} and {kind} are substituted at launch.
+// cap.task-kind and cap.project are optional; absent means the record applies
+// to every kind or every project. cap.project takes one or more comma-separated
+// names. Placeholders {task}, {project}, {path} and {kind} are substituted at
+// launch.
 // cap never edits knowledge. A missing or ambiguous set of records is a
 // question, never a guess.
 type knowledgeChoice struct {
@@ -29,6 +32,7 @@ type parsedKnowledge struct {
 	commands  []string
 	agent     string
 	taskKinds []string
+	projects  []string
 }
 
 func resolve(store state.Store, task board.Task) (knowledgeChoice, []knowledgeChoice, error) {
@@ -44,6 +48,9 @@ func choose(task board.Task, rows []state.Row) (knowledgeChoice, []knowledgeChoi
 	for _, r := range rows {
 		p := parseKnowledge(r)
 		if len(p.taskKinds) > 0 && !containsFold(p.taskKinds, task.Kind) {
+			continue
+		}
+		if len(p.projects) > 0 && !containsFold(p.projects, task.Project) {
 			continue
 		}
 		for _, command := range p.commands {
@@ -93,6 +100,13 @@ func parseKnowledge(r state.Row) parsedKnowledge {
 			for _, f := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
 				if f != "" {
 					p.taskKinds = append(p.taskKinds, f)
+				}
+			}
+		case strings.HasPrefix(lower, "cap.project:"):
+			v := markerValue(line, len("cap.project:"))
+			for _, f := range strings.Split(v, ",") {
+				if f = strings.TrimSpace(f); f != "" {
+					p.projects = append(p.projects, f)
 				}
 			}
 		}

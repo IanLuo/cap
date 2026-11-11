@@ -151,6 +151,70 @@ func TestAC4ConfirmedMeansHeld(t *testing.T) {
 	}
 }
 
+// AC4a: a recipe is scoped to the projects it names. One record scoped to
+// project a, one unscoped. A task in b sees only the unscoped record; a task in
+// c, named by no record, asks and launches nothing.
+func TestAC4aRecipeScopedToProjects(t *testing.T) {
+	b := &fakeBoard{tasks: []board.Task{
+		{Task: "t-b", Project: "b", Kind: "dev", State: "open", ProjectPath: "/tmp/b"},
+		{Task: "t-c", Project: "c", Kind: "dev", State: "open", ProjectPath: "/tmp/c"},
+	}}
+	s, path := newStorePath(t)
+	c := newClock("2026-11-07T12:00:00Z")
+	seedKnowledge(t, path, "cap.dispatch: scoped {task}\ncap.agent: fake\ncap.project: a, b")
+	seedKnowledge(t, path, "cap.dispatch: every {task}\ncap.agent: fake")
+
+	// Project b is named by both records: the set is ambiguous, so cap asks.
+	l := &fakeLauncher{}
+	d := testDispatcher(b, s, l, c)
+	if _, err := d.Act(ctx(), "t-b"); err == nil || !IsRefusal(err) {
+		t.Fatalf("act with two matching recipes = %v, want refusal", err)
+	}
+	if len(l.calls) != 0 {
+		t.Fatalf("launched %d commands on an ambiguous set", len(l.calls))
+	}
+
+	// A task in c matches only the unscoped record, so it launches that one.
+	if _, err := d.Act(ctx(), "t-c"); err != nil {
+		t.Fatalf("act in an unscoped project: %v", err)
+	}
+	if len(l.calls) != 1 {
+		t.Fatalf("launches = %d, want 1", len(l.calls))
+	}
+	if got := l.calls[0].Command; !strings.Contains(got, "every t-c") || strings.Contains(got, "scoped") {
+		t.Fatalf("launched %q, want the unscoped record only", got)
+	}
+}
+
+// A scoped record alone must not launch in a project it does not name.
+func TestAC4aScopedRecordDoesNotMatchAnotherProject(t *testing.T) {
+	b := &fakeBoard{tasks: []board.Task{
+		{Task: "t-a", Project: "a", Kind: "dev", State: "open", ProjectPath: "/tmp/a"},
+		{Task: "t-c", Project: "c", Kind: "dev", State: "open", ProjectPath: "/tmp/c"},
+	}}
+	s, path := newStorePath(t)
+	c := newClock("2026-11-07T12:00:00Z")
+	seedKnowledge(t, path, "cap.dispatch: scoped {task}\ncap.agent: fake\ncap.project: a")
+	l := &fakeLauncher{}
+	d := testDispatcher(b, s, l, c)
+
+	if _, err := d.Act(ctx(), "t-a"); err != nil {
+		t.Fatalf("act in the named project: %v", err)
+	}
+	if _, err := d.Act(ctx(), "t-c"); err == nil || !IsRefusal(err) {
+		t.Fatalf("act in an unnamed project = %v, want refusal", err)
+	}
+	if len(l.calls) != 1 {
+		t.Fatalf("launches = %d, want 1", len(l.calls))
+	}
+	if n := countOpen(t, s, state.Scope("c"), state.KindQuestion); n != 1 {
+		t.Fatalf("questions in c = %d, want 1", n)
+	}
+	if n := countOpen(t, s, state.Scope("c"), state.KindAct); n != 0 {
+		t.Fatalf("acts in c = %d, want 0", n)
+	}
+}
+
 // AC5: missing knowledge asks once. One question, no command, fs unchanged, and
 // a second instruction for the same gap opens no second question.
 func TestAC5MissingKnowledgeAsksOnce(t *testing.T) {
