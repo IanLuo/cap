@@ -1,4 +1,4 @@
-<!-- specs:locked:a04ad06 2026-11-11 type=spec -->
+<!-- specs:locked:466ce86 2026-11-11 type=spec -->
 
 ## Link contract
 - **upstream** (this doc relies on): none
@@ -62,8 +62,8 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **AC4a · A recipe is scoped to the projects it names.** Given a knowledge record with `cap.project:`, then it matches only tasks whose project is listed. Given no `cap.project:` marker, it matches every project. A task whose project no record names gets one `cap.question` and no command.
 - **AC4b · A review inherits its parent's path.** Given a task with no `project_path` and a `parent_dev` in the same project, then cap launches it in the parent dev task's `project_path`. Given neither, then cap asks and launches nothing.
 - **AC5 · Missing knowledge asks.** Given no knowledge record names a command for the act, when the user instructs the task, then one `cap.question` is written, no command is launched, fs is unchanged, and a second instruction for the same gap opens no second question.
-- **AC6 · cap writes nothing in fs.** Given any tick or act, then fs holds no new task, report, claim or review task from cap, and cap never appears as a holder. The smallest refusal: any attempt by cap to write there.
-- **AC7 · The rank holds.** Given one unheld review and one unheld dev task, the recommendation names the review first. Given dev tasks only, the oldest. A task with an unconfirmed act younger than 90 s is not recommended again.
+- **AC6 · cap writes nothing in fs.** Given any tick or act, then fs holds no new task, report, claim or review task from cap, and cap never appears as a holder. A command cap runs may start an agent through fs; the `fs.launch` row it leaves is fs's own record of a process fs started, not a write by cap. The smallest refusal: any attempt by cap to write there.
+- **AC7 · The rank holds.** Given one unheld review and one unheld dev task, the recommendation names the review first. Given dev tasks only, the oldest. A task with an unconfirmed act younger than 90 s is not recommended again. A review whose newest review report is `fail` or `blocked` is not recommended while its parent dev task has no `dev-done` newer than that verdict; with a newer `dev-done`, the review is recommended again. Given no `parent_dev`, the review is recommended.
 - **AC8 · The instruction gate.** Given an instruction for a task launched less than 90 s ago, then nothing is launched, and the refusal names the earlier launch.
 - **AC9 · Zero tokens on the clock.** Given a day of ticks, then no model call was made by the watcher, and the report is text.
 - **AC10 · Fail closed.** Given an unreadable board or store, then the tick exits non-zero, names the cause, and launches nothing.
@@ -74,6 +74,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 ## KPIs & failure signal
 
 - **Good:** every actable task appears in a recommendation within two ticks (≤60 s); at least 70% of recommendations are acted on; the age of the oldest actable task falls week over week.
+- **Actable:** a task cap could act on now. A review whose newest review report is `fail` or `blocked`, with no newer `dev-done` on its parent dev task, is not actable.
 - **Measured from what exists:** fs rows give actable-since and held-at; the watcher's trace log gives recommendations and instructions. No telemetry, no counters in the store.
 - **Off-switch: fewer than 30% of recommendations are acted on for two weeks.** Then the rank is wrong or the board is not the bottleneck, and cap is adding attention rather than saving it. The remedy is the rank or the knowledge, never more recommendations.
 - **Second signal:** an actable task older than a week that cap has recommended and the user rejected twice — the rank and the user disagree about what matters.
@@ -91,7 +92,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 
 | # | assumption | falsified by | then |
 |---|---|---|---|
-| A1 | fs keeps five verbs and never starts a process. | fs grows its own dispatch. | cap calls it and drops its own launcher. |
+| A1 | fs starts agents (`dispatch`, `reap`); how to start one is knowledge, and cap runs the named command through its generic detached launcher. | knowledge names no command, or names two. | cap asks; it never falls back to a hard-coded launcher. |
 | A2 | how to start a worker is knowledge, not code. Today it is herdr. | knowledge names no command, or names two. | cap asks; it never falls back to a hard-coded launcher. |
 | A3 | memstore is the only store; cap owns no database. | cap needs state memstore cannot hold. | record it as state and name what is lost; no second store. |
 | A4 | a locked spec doc is the contract, found by grep. | a task has no locked doc. | cap refuses the task and names the missing doc. |
@@ -142,7 +143,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 | AC4b review inherits its path | a review with no path and a parent dev: launched in the parent's path; with neither: one question, no command. |
 | AC5 missing knowledge asks | no knowledge: one question, no command, fs unchanged, no second question. |
 | AC6 cap writes nothing in fs | `fs status` before and after: identical; no claim row from cap. |
-| AC7 the rank holds | one review and one dev unheld: review first; dev only: oldest; unconfirmed act inside the gate: not recommended. |
+| AC7 the rank holds | one review and one dev unheld: review first; dev only: oldest; unconfirmed act inside the gate: not recommended; a failed review with no newer parent `dev-done`: not recommended and the parent dev is; after a newer `dev-done`: the review is first. |
 | AC8 the instruction gate | two instructions inside 90 s: one launch, the second refused with the earlier time. |
 | AC9 zero tokens | the watcher path has no model client; a test asserts no call over a simulated day. |
 | AC10 fail closed | an unreadable store: non-zero exit, no launch, no record. |
@@ -157,4 +158,4 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 | independent check | one review task, in a session that did not write cap, reads this locked doc against the change and asks: can cap act without writing in fs, and can anything launch without an instruction. |
 | manual, once | one tick on the real board with a real unheld task, observed in fs and in the pane list. |
 
-Last reviewed: 2026-11-08 · cap
+Last reviewed: 2026-11-11 · cap
