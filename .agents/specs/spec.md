@@ -60,6 +60,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **AC3 · A stranger reconstructs the act.** Given the task id, a reader combines the fs row (holder, lease, last report) with the `cap.act` record (command, agent kind, knowledge id, time, observed result) and knows what happened. Neither source repeats the other.
 - **AC4 · Confirmed means held.** Given a launch, when a later tick shows a holder, then the record is confirmed. When no holder appears, then the record stays unconfirmed and the report names it. cap never marks a task failed.
 - **AC4a · A recipe is scoped to the projects it names.** Given a knowledge record with `cap.project:`, then it matches only tasks whose project is listed. Given no `cap.project:` marker, it matches every project. A task whose project no record names gets one `cap.question` and no command.
+- **AC4b · A review inherits its parent's path.** Given a task with no `project_path` and a `parent_dev` in the same project, then cap launches it in the parent dev task's `project_path`. Given neither, then cap asks and launches nothing.
 - **AC5 · Missing knowledge asks.** Given no knowledge record names a command for the act, when the user instructs the task, then one `cap.question` is written, no command is launched, fs is unchanged, and a second instruction for the same gap opens no second question.
 - **AC6 · cap writes nothing in fs.** Given any tick or act, then fs holds no new task, report, claim or review task from cap, and cap never appears as a holder. The smallest refusal: any attempt by cap to write there.
 - **AC7 · The rank holds.** Given one unheld review and one unheld dev task, the recommendation names the review first. Given dev tasks only, the oldest. A task with an unconfirmed act younger than 90 s is not recommended again.
@@ -101,7 +102,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 
 ## Data requirements
 
-- **Inputs:** one `fs status` over every project; memstore rows filtered to kind `knowledge`; the task's `project_path` for the launcher's working directory.
+- **Inputs:** one `fs status` over every project; memstore rows filtered to kind `knowledge`; the task's `project_path`, or its parent dev task's when absent, for the launcher's working directory.
 - **cap's state, kinds it owns, scope `cap:<project>`:**
   - `cap.act` — one open record per task: command, agent kind, knowledge id, launched-at, observed result.
   - `cap.question` — one open record per gap: what is missing, which task needs it, when.
@@ -109,7 +110,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **The board has one source.** cap never reads `fs.*` rows through memstore; those rows are fs's own, and reading them beside knowledge is how a supervisor confuses a task with a fact.
 - **The trace is a file, not a store.** One JSON line per tick and per act in cap's own log, rotated and deleted when large. It never gates a decision and cap never reads it.
 - **Must survive:** the open `cap.act` and `cap.question` records, so a restart does not repeat an act or a question. Nothing else.
-- **Empty and edge:** a tick with no change writes nothing. A board with no actable task reports nothing. A task with no `project_path` cannot be dispatched: cap writes one question naming it. A question closes when a knowledge record answers it.
+- **Empty and edge:** a tick with no change writes nothing. A board with no actable task reports nothing. A task with no `project_path` uses its `parent_dev` task's path; with neither, it cannot be dispatched: cap writes one question naming it. A question closes when a knowledge record answers it.
 
 ## Rollback & recovery
 
@@ -138,6 +139,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 | AC3 a stranger reconstructs | a fresh session reads one `cap.act` and the fs row and names command, knowledge id, outcome. |
 | AC4 confirmed means held | fake launcher that claims late, then never: confirmed on a later tick, then reported unconfirmed. |
 | AC4a recipe is project-scoped | two records, one scoped to a and one unscoped: a task in b matches only the unscoped one; a task in c with only the scoped record asks. |
+| AC4b review inherits its path | a review with no path and a parent dev: launched in the parent's path; with neither: one question, no command. |
 | AC5 missing knowledge asks | no knowledge: one question, no command, fs unchanged, no second question. |
 | AC6 cap writes nothing in fs | `fs status` before and after: identical; no claim row from cap. |
 | AC7 the rank holds | one review and one dev unheld: review first; dev only: oldest; unconfirmed act inside the gate: not recommended. |
