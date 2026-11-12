@@ -1,4 +1,4 @@
-<!-- specs:locked:466ce86 2026-11-11 type=spec -->
+<!-- specs:locked:27c9691 2026-11-12 type=spec -->
 
 ## Link contract
 - **upstream** (this doc relies on): none
@@ -95,7 +95,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 | A1 | fs starts agents (`dispatch`, `reap`); how to start one is knowledge, and cap runs the named command through its generic detached launcher. | knowledge names no command, or names two. | cap asks; it never falls back to a hard-coded launcher. |
 | A2 | how to start a worker is knowledge, not code. Today it is herdr. | knowledge names no command, or names two. | cap asks; it never falls back to a hard-coded launcher. |
 | A3 | memstore is the only store; cap owns no database. | cap needs state memstore cannot hold. | record it as state and name what is lost; no second store. |
-| A4 | a locked spec doc is the contract, found by grep. | a task has no locked doc. | cap refuses the task and names the missing doc. |
+| A4 | a locked spec doc is the contract, found by grep. | a task has no locked doc. | nothing: the doc is the user's input, not cap's. cap reads no doc and refuses only on an unreadable board, store, or command, or on missing or ambiguous knowledge. |
 | A5 | a worker's health is observable: from its fs reports, or from the harness when knowledge says how. | neither source is readable. | cap reports `unknown` and never treats silence as working. |
 | A6 | a worker is prompted once and works; fs's 120 s lease is the worker's clock, not cap's. | the worker blocks or asks. | the tick reports the state it sees; the user answers. cap never polls a worker. |
 | A7 | a merge is a worker's job, not the coordinator's. | no worker is free to merge. | the user merges and says so; cap records only what it launched. |
