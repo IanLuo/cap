@@ -30,10 +30,7 @@ func (w *Watcher) recommend(tasks []board.Task, rows []state.Row, now time.Time)
 	type candidate struct {
 		task board.Task
 	}
-	byTask := make(map[string]board.Task, len(tasks))
-	for _, t := range tasks {
-		byTask[t.Task] = t
-	}
+	byTask := indexTasks(tasks)
 	var actable []candidate
 	for _, t := range tasks {
 		if t.State != "open" {
@@ -58,13 +55,21 @@ func (w *Watcher) recommend(tasks []board.Task, rows []state.Row, now time.Time)
 			Reason:  reason(c.task),
 			Earlier: earlier(all[c.task.Task], now, w.gate()),
 		}
+		// Name the command Act would run, not the task's raw record: Act takes
+		// the parent dev task's path, and asks when there is none.
+		t := withPath(c.task, byTask)
+		if t.ProjectPath == "" {
+			rec.Gap = "task has no project_path; dispatch needs a working directory"
+			out = append(out, rec)
+			continue
+		}
 		choice, candidates, err := resolve(w.Store, c.task)
 		if err != nil {
 			return nil, fmt.Errorf("resolve knowledge for %s: %w", c.task.Task, err)
 		}
 		switch {
 		case choice.Command != "":
-			rec.Command = render(choice.Command, c.task)
+			rec.Command = render(choice.Command, t)
 			rec.Agent = choice.Agent
 			rec.Knowledge = strconv.FormatInt(choice.ID, 10)
 		case len(candidates) == 0:
@@ -75,6 +80,27 @@ func (w *Watcher) recommend(tasks []board.Task, rows []state.Row, now time.Time)
 		out = append(out, rec)
 	}
 	return out, nil
+}
+
+// withPath returns the task with the working directory cap would launch in: its
+// own project_path, else its parent dev task's in the same project. An empty
+// result means Act asks and launches nothing.
+func withPath(t board.Task, byTask map[string]board.Task) board.Task {
+	if t.ProjectPath != "" || t.ParentDev == "" {
+		return t
+	}
+	if dev, ok := byTask[t.ParentDev]; ok && dev.Project == t.Project {
+		t.ProjectPath = dev.ProjectPath
+	}
+	return t
+}
+
+func indexTasks(tasks []board.Task) map[string]board.Task {
+	m := make(map[string]board.Task, len(tasks))
+	for _, t := range tasks {
+		m[t.Task] = t
+	}
+	return m
 }
 
 // awaitingFix reports whether a review's newest verdict is fail or blocked and

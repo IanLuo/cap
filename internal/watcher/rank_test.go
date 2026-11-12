@@ -53,6 +53,51 @@ func recommended(t *testing.T, w *Watcher, s *state.MemStore, tasks []board.Task
 	return out
 }
 
+// The recommendation names the command Act would run. A review with no path of
+// its own resolves its parent dev task's path; a task with no path anywhere
+// carries a gap, because Act asks instead of launching.
+func TestRecommendationNamesTheCommandActRuns(t *testing.T) {
+	b := &fakeBoard{tasks: []board.Task{
+		{Task: "t-dev", Project: "p", Kind: "dev", State: "done", ProjectPath: "/tmp/p"},
+		{Task: "t-rev", Project: "p", Kind: "review", State: "open", ParentDev: "t-dev"},
+		{Task: "t-lost", Project: "p", Kind: "dev", State: "open"},
+	}}
+	s, path := newStorePath(t)
+	c := newClock("2026-11-11T12:00:00Z")
+	seedKnowledge(t, path, "cap.dispatch: echo {task} in {path}\ncap.agent: fake\ncap.task-kind: review")
+
+	rows, err := s.Recent(state.Scope("p"), 1000)
+	if err != nil {
+		t.Fatalf("read rows: %v", err)
+	}
+	w := testWatcher(b, s, c)
+	recs, err := w.recommend(b.tasks, rows, c.Now())
+	if err != nil {
+		t.Fatalf("recommend: %v", err)
+	}
+	byID := make(map[string]Recommendation, len(recs))
+	for _, r := range recs {
+		byID[r.Task.Task] = r
+	}
+
+	rev := byID["t-rev"]
+	if rev.Command != "echo t-rev in /tmp/p" {
+		t.Fatalf("t-rev command = %q, want the parent dev task's path", rev.Command)
+	}
+	if lost := byID["t-lost"]; lost.Command != "" || lost.Gap == "" {
+		t.Fatalf("t-lost = %+v, want a gap and no command", lost)
+	}
+
+	l := &fakeLauncher{}
+	d := testDispatcher(b, s, l, c)
+	if _, err := d.Act(ctx(), "t-rev"); err != nil {
+		t.Fatalf("act t-rev: %v", err)
+	}
+	if len(l.calls) != 1 || l.calls[0].Command != rev.Command || l.calls[0].Dir != "/tmp/p" {
+		t.Fatalf("act launched %+v, want the recommended command in /tmp/p", l.calls)
+	}
+}
+
 // AC7: a failed review is not recommended again until its parent dev reports a
 // dev-done newer than the verdict. The fix makes the review actable again.
 func TestFailedReviewWaitsForAFix(t *testing.T) {
