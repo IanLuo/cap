@@ -39,10 +39,6 @@ func (w *Watcher) closeGrace() time.Duration {
 // takes at most one action per task and class inside the gate. It never
 // dispatches, never closes an fs-launched pane, and never answers a blocked
 // agent. A side effect that fails is recorded and reported, not retried.
-// tier1 reads the transitions between the previous cursor and this tick and
-// takes at most one action per task and class inside the gate. It never
-// dispatches, never closes an fs-launched pane, and never answers a blocked
-// agent. A side effect that fails is recorded and reported, not retried.
 // paneBaseline says the previous cursor holds no pane snapshot, so no pane can
 // have moved; the reap keys off the board change instead, and still runs.
 func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Task, panes []agents.Pane, rows []state.Row, changes []Change, paneBaseline bool) ([]state.Action, []string, error) {
@@ -111,7 +107,10 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 				e.blocked(t, p)
 			}
 		case "idle":
-			if t.State != "claimed" || t.LeaseLive {
+			// fs reads a lapsed claim as an open task that still names its
+			// session, so a holder plus a lapsed lease is the nudge case. A
+			// done task's pane is fs's to reap, never a prompt.
+			if t.State == "done" || t.Session == "" || t.LeaseLive {
 				continue
 			}
 			leaseLapsed := false
@@ -151,9 +150,10 @@ type engine struct {
 	orphanAsked bool
 }
 
-// reapClosed calls fs reap once per project whose round just closed while the
-// pane fs launched is still open. The closed task is gone from this board read,
-// so its pane comes from the previous cursor.
+// reapClosed calls fs reap once per project whose round just ended while the
+// pane fs launched is still open. fs decides which pane to close; cap notices
+// the transition that ended the round: the task left the board, its lease
+// lapsed, or its session's newest review word became fail or blocked.
 func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
 	if e.w.Reap == nil || e.old == nil {
 		return
@@ -162,27 +162,75 @@ func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
 	for _, t := range e.old.Tasks {
 		oldByTask[t.Task] = t
 	}
-	done := map[string]bool{}
+
+	type roundEnd struct{ project, task, pane, why string }
+	var ended []roundEnd
+	reaped := map[string]bool{}
+	add := func(r roundEnd) {
+		if reaped[r.project] {
+			return
+		}
+		reaped[r.project] = true
+		ended = append(ended, r)
+	}
+
+	// A task that left the board carries its pane from the previous cursor.
 	for _, c := range changes {
 		if !strings.HasPrefix(c.Reason, "no longer open") {
 			continue
 		}
-		t, ok := oldByTask[c.Task]
-		if !ok || t.Pane == "" || done[t.Project] {
+		o, ok := oldByTask[c.Task]
+		if !ok || o.Pane == "" {
 			continue
 		}
-		if _, open := paneByID[t.Pane]; !open {
+		if _, open := paneByID[o.Pane]; !open {
 			continue
 		}
-		done[t.Project] = true
-		project := t.Project
+		add(roundEnd{c.Project, c.Task, o.Pane, "round closed for task " + c.Task + ", pane " + o.Pane + " still open"})
+	}
+
+	// A task still on the board whose round ended without the task closing.
+	for _, t := range e.tasks {
+		if t.Process.Pane == "" || reaped[t.Project] {
+			continue
+		}
+		if _, open := paneByID[t.Process.Pane]; !open {
+			continue
+		}
+		o, known := oldByTask[t.Task]
+		if !known {
+			continue
+		}
+		switch {
+		case o.LeaseLive && !t.LeaseLive:
+			add(roundEnd{t.Project, t.Task, t.Process.Pane, "lease lapsed on task " + t.Task + ", pane " + t.Process.Pane + " still open"})
+		case reviewVerdictEnded(o, t):
+			add(roundEnd{t.Project, t.Task, t.Process.Pane, "review verdict " + t.Agent.Reported + " on task " + t.Task + ", pane " + t.Process.Pane + " still open"})
+		}
+	}
+
+	for _, r := range ended {
+		project := r.project
 		e.perform(state.Action{
 			Class:   ClassReap,
 			Target:  project,
 			Project: project,
-			Trigger: "round closed for task " + t.Task + ", pane " + t.Pane + " still open",
+			Trigger: r.why,
 		}, func() error { return e.w.Reap.Reap(e.ctx, project) })
 	}
+}
+
+// reviewVerdictEnded reports whether the task's session has just said fail or
+// blocked as a reviewer. Only the newest word counts: a verdict already in the
+// previous cursor ended a round that has been reaped.
+func reviewVerdictEnded(o state.CursorTask, t board.Task) bool {
+	if t.Agent.Role != "review" || t.Agent.At == nil {
+		return false
+	}
+	if t.Agent.Reported != "fail" && t.Agent.Reported != "blocked" {
+		return false
+	}
+	return o.NewestReport == nil || t.Agent.At.After(*o.NewestReport)
 }
 
 func (e *engine) closeEmpty(p agents.Pane, first time.Time) {
@@ -208,7 +256,7 @@ func (e *engine) nudge(t board.Task, p agents.Pane) {
 		Task:    t.Task,
 		Pane:    p.ID,
 		Round:   t.Round,
-		Trigger: "task claimed, lease lapsed, agent idle",
+		Trigger: "lapsed claim, agent idle",
 	}, func() error { return e.w.Agents.Prompt(e.ctx, p.ID, text) })
 }
 

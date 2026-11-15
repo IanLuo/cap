@@ -68,16 +68,19 @@ func tierWatcher(b board.Reader, s state.Store, h agents.Harness, r board.Reaper
 	return w
 }
 
-// claimedTask is one fs task a launcher holds: claimed, with the pane fs
-// started. leaseLive is what fs reports for the lease this tick.
+// claimedTask is one fs task a launcher holds, with the pane fs started. fs
+// reads a lapsed claim as an open task that still names its session, so the
+// hold state follows the lease.
 func claimedTask(id, project, pane string, round int, leaseLive bool) board.Task {
+	hold := "open"
 	var exp *time.Time
 	if leaseLive {
+		hold = "claimed"
 		v, _ := time.Parse(time.RFC3339, "2026-11-15T10:05:00Z")
 		exp = &v
 	}
 	return board.Task{
-		Task: id, Project: project, Kind: "dev", State: "claimed",
+		Task: id, Project: project, Kind: "dev", State: hold,
 		Session: "s-1", Round: round, LeaseLive: leaseLive, LeaseExpires: exp,
 		Process: board.Process{Status: "working", Pane: pane},
 	}
@@ -197,6 +200,77 @@ func TestAC14ReapsOnTheBaselineTick(t *testing.T) {
 	}
 }
 
+// AC14, round ended without the task closing: a lapsed lease or a fresh review
+// verdict still reaps the project while the pane is open.
+func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
+	t.Run("lease lapsed", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+
+		if _, err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("first tick: %v", err)
+		}
+		b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)}
+		report := tick(t, w, c, 30*time.Second)
+
+		if len(rp.calls) != 1 || rp.calls[0] != "cap" {
+			t.Fatalf("reap calls = %v, want exactly [cap]", rp.calls)
+		}
+		if len(h.closed) != 0 {
+			t.Fatalf("cap closed %v; only fs closes an fs-launched pane", h.closed)
+		}
+		var reaped bool
+		for _, a := range report.Actions {
+			if a.Class == ClassReap {
+				reaped = true
+			}
+		}
+		if !reaped {
+			t.Fatalf("actions = %+v, want a reap", report.Actions)
+		}
+
+		quiet := tick(t, w, c, 30*time.Second)
+		if len(rp.calls) != 1 {
+			t.Fatalf("reap calls = %v after the transition passed; a reap is not repeated", rp.calls)
+		}
+		if len(quiet.Actions) != 0 {
+			t.Fatalf("actions = %+v on an unchanged tick", quiet.Actions)
+		}
+	})
+
+	t.Run("review verdict", func(t *testing.T) {
+		verdictAt, _ := time.Parse(time.RFC3339, "2026-11-15T10:00:30Z")
+		failed := claimedTask("t-2", "cap", "p2", 1, true)
+		failed.Kind = "review"
+		failed.Agent = board.Observed{Role: "review", State: "fail", Reported: "fail", At: &verdictAt}
+		b := &fakeBoard{tasks: []board.Task{failed}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p2", "claude", "idle")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+
+		if _, err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("first tick: %v", err)
+		}
+		if len(rp.calls) != 0 {
+			t.Fatalf("reap calls = %v; the verdict was already there at baseline", rp.calls)
+		}
+		verdictAt = verdictAt.Add(time.Minute)
+		failed.Agent.At = &verdictAt
+		b.tasks = []board.Task{failed}
+		tick(t, w, c, 30*time.Second)
+
+		if len(rp.calls) != 1 || rp.calls[0] != "cap" {
+			t.Fatalf("reap calls = %v, want exactly [cap] on the new verdict", rp.calls)
+		}
+	})
+}
+
 // AC15: a second transition inside the gate runs nothing, and the refusal names
 // the earlier action.
 func TestAC15OneActionPerClassInGate(t *testing.T) {
@@ -215,7 +289,13 @@ func TestAC15OneActionPerClassInGate(t *testing.T) {
 	if len(h.prompts) != 1 {
 		t.Fatalf("prompts = %d, want one nudge on the lapsed lease", len(h.prompts))
 	}
-	if len(first.Actions) != 1 || first.Actions[0].Class != ClassNudge {
+	nudges := 0
+	for _, a := range first.Actions {
+		if a.Class == ClassNudge {
+			nudges++
+		}
+	}
+	if nudges != 1 {
 		t.Fatalf("actions = %+v, want one nudge", first.Actions)
 	}
 
@@ -294,6 +374,25 @@ func TestAC16NudgeIsBounded(t *testing.T) {
 		}
 		if len(h.prompts) != 0 {
 			t.Fatalf("working agent prompted %d times", len(h.prompts))
+		}
+	})
+
+	t.Run("never a done task's pane", func(t *testing.T) {
+		done := claimedTask("t-1", "cap", "p1", 1, false)
+		done.State = "done"
+		b := &fakeBoard{tasks: []board.Task{done}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+
+		if _, err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("first tick: %v", err)
+		}
+		h.panes = []agents.Pane{pane("p1", "claude", "idle")} // a transition, under a done task
+		tick(t, w, c, 100*time.Second)
+		if len(h.prompts) != 0 {
+			t.Fatalf("done task's agent prompted %d times", len(h.prompts))
 		}
 	})
 }
