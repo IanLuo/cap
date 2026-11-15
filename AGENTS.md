@@ -41,7 +41,7 @@ nix build .
 - **cap writes nothing in fs and never claims there.** The code has no `fs add/claim/report/done`; its board seam has one read method plus `Reap`. The only claim cap holds is `cap.claim`, its own tool's write lease.
 - **cap owns five kinds:** `cap.act`, `cap.action`, `cap.claim`, `cap.question`, `cap.cursor`, in `cap:<project>`; the board-wide cursor, claim and orphan scope is `cap:cap`. One open act per task, one open question per task and gap, one open cursor, one open claim. The cursor is written only when the board or the harness changes.
 - **One claimant holds the write verbs.** `act`, `start` and `stop` run only for the session that holds a live `cap.claim` (120 s, renewed by the holder's write); any other session is refused with the holder and its expiry named. An unclaimed or stale cap is claimed only with `--confirm`. `tick`, `watch`, `logs` and `status` need no claim. The claim coordinates; a session id is self-declared, so it is not authentication.
-- **Tier 1 acts only on a transition** between the previous cursor and this read, never on elapsed time alone. An empty pane's grace delays a transition already seen; it never starts one.
+- **Tier 1 acts only on a transition** between the previous cursor and this read, never on elapsed time alone. An empty pane's grace delays a transition already seen; it never starts one. With no previous cursor, or a cursor that kept no pane snapshot, the tick is the baseline: it calls `fs reap` once per project that still has an open fs pane, and no later tick reaps without a board transition.
 - **One action per task and class per 90 s, recorded before the side effect.** The gate and the refusal name the earlier action, exactly as `cap act` does. A failed action is recorded and reported, never retried inside the gate.
 - **An fs-launched pane is reaped by fs, never closed by cap.** A pane that never held an agent is a human terminal: never closed. A pane that held an agent and lost it, with no launch row, is closed only after the 300 s grace. A pane that still holds an agent and has no launch row is human-owned: cap announces a blocked one and never closes it.
 - **A blocked agent is never answered.** A transition into `blocked` writes one question and posts one notification; cap sends no prompt and no keys.
@@ -52,7 +52,7 @@ nix build .
 - **Fail closed.** Unreadable board, store, or command means non-zero exit, no open act record, no launch. No fallback store, no retry. An unreadable harness skips tier 1 for that tick only: the cursor is not written, so the next readable tick replays the transition; it never stops the board read or the report.
 - **Rank:** unheld review before unheld dev; then fs's oldest-first task order (preserved as the board returns it). A task with an unconfirmed act younger than 90 s is skipped. A review whose newest review report is `fail` or `blocked` is skipped until its parent dev task reports a `dev-done` newer than that verdict.
 - **Knowledge is never edited by cap.** A dispatch record must name exactly one `cap.dispatch:` command. Zero candidates or two distinct commands raises exactly one question and launches nothing.
-- **The trace is a file, not a store.** One JSON line per tick and per act, rotated at 1 MiB. `cap status` and `cap logs` read it for the operator; no decision does, and it never gates a decision.
+- **The trace is a file, not a store.** One JSON line per tick, per act and per tier-1 decision (`kind` `action`: class, target, project, task, pane, trigger, result), rotated at 1 MiB. `cap status` and `cap logs` read it for the operator; no decision does, and it never gates a decision.
 - **The interface controls one label.** `status`, `start`, `stop` and `logs` act on `home-manager.cap` only. They never launch a task command and never read fs. `start` leaves a running watcher running; `stop` bootouts the label. `start` and `stop` read and write the one `cap.claim` row, and `status` reads it; `logs` touches no store.
 - **One watcher.** The nix module (`homeManagerModules.default`) runs `cap watch` under launchd with KeepAlive. Do not add a second supervisor or a second label.
 
@@ -79,7 +79,7 @@ internal/state/   the five cap record kinds; the only memstore importer
 internal/watcher/ tick (no launcher, tier 1), act (one launcher), rank, knowledge, report
 internal/launch/  detached sh -c in the project directory; knows nothing about herdr
 internal/service/ one launchd label: status, start, stop; knows nothing about tasks
-internal/trace/   one JSON line per tick and act; rotates; never gates
+internal/trace/   one JSON line per tick, act and tier-1 decision; rotates; never gates
 vendor/           memstore + pure-Go sqlite, committed for hermetic builds
 ```
 

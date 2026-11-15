@@ -94,9 +94,10 @@ func (w *Watcher) Tick(ctx context.Context) (Report, error) {
 	}
 	// Tier 1 needs a previous pane snapshot to compare panes with. A cursor
 	// from a build that kept none is a baseline for panes, not a reason to
-	// skip the reap: that keys off the board change.
+	// skip the reap: that keys off the board change. No cursor at all is the
+	// first read: its one act is the baseline reap.
 	paneBaseline := old != nil && len(old.Panes) == 0 && len(panes) > 0
-	if harnessOK && old != nil {
+	if harnessOK {
 		actions, refused, err := w.tier1(ctx, old, tasks, panes, rows, report.Changes, paneBaseline)
 		if err != nil {
 			return report, err

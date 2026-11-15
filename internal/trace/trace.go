@@ -1,5 +1,5 @@
-// Package trace is cap's own log: one JSON line per tick and per act. It never
-// gates a decision and cap never reads it.
+// Package trace is cap's own log: one JSON line per tick, per act and per
+// tier-1 decision. It never gates a decision and cap never reads it.
 package trace
 
 import (

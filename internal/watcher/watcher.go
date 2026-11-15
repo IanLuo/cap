@@ -27,8 +27,8 @@ const (
 	knowledgeLimit = 256
 )
 
-// Trace is cap's own log: one JSON line per tick and per act. It never gates a
-// decision, and cap never reads it.
+// Trace is cap's own log: one JSON line per tick, per act and per tier-1
+// decision. It never gates a decision, and cap never reads it.
 type Trace interface {
 	Write(event map[string]any)
 }

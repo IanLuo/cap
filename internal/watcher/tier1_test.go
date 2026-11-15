@@ -119,6 +119,20 @@ func seedNudge(t *testing.T, s state.Store, task string, round int, at time.Time
 	}
 }
 
+// seedCursor writes the cursor a previous tick would have left: the open board
+// and the harness snapshot it saw. The next tick compares against it, so no
+// baseline reap runs and no earlier action closes the gate.
+func seedCursor(t *testing.T, s state.Store, at time.Time, tasks []board.Task, panes []agents.Pane) {
+	t.Helper()
+	text, err := state.Encode(state.Cursor{At: at, Tasks: snapshot(tasks), Panes: paneSnapshot(panes, nil, at)})
+	if err != nil {
+		t.Fatalf("encode cursor: %v", err)
+	}
+	if _, err := s.Put(state.KindCursor, state.CursorScope, "board cursor", text); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+}
+
 func questionsIn(t *testing.T, s state.Store, scope string) []state.Question {
 	t.Helper()
 	rows, err := s.Recent(scope, 1000)
@@ -158,13 +172,7 @@ func TestAC14TierOneActsOnlyOnTransitions(t *testing.T) {
 	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
 	rp := &fakeReaper{}
 	w := tierWatcher(b, s, h, rp, c)
-
-	if _, err := w.Tick(context.Background()); err != nil {
-		t.Fatalf("first tick: %v", err)
-	}
-	if len(rp.calls) != 0 {
-		t.Fatalf("first tick reaped %v; nothing had changed yet", rp.calls)
-	}
+	seedCursor(t, s, c.at, b.tasks, h.panes) // the previous tick saw the round open
 
 	b.tasks = nil // the round closed; the pane fs started is still open
 	report := tick(t, w, c, 30*time.Second)
@@ -231,9 +239,7 @@ func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
 		for i := 0; i < maxNudgesPerRound; i++ {
 			seedNudge(t, s, "t-1", 1, c.at.Add(-time.Hour))
 		}
-		if _, err := w.Tick(context.Background()); err != nil {
-			t.Fatalf("first tick: %v", err)
-		}
+		seedCursor(t, s, c.at, b.tasks, h.panes)
 		b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)}
 		report := tick(t, w, c, 30*time.Second)
 
@@ -273,9 +279,7 @@ func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
 		rp := &fakeReaper{}
 		w := tierWatcher(b, s, h, rp, c)
 
-		if _, err := w.Tick(context.Background()); err != nil {
-			t.Fatalf("first tick: %v", err)
-		}
+		seedCursor(t, s, c.at, b.tasks, h.panes)
 		b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)}
 		tick(t, w, c, 30*time.Second)
 
@@ -299,11 +303,12 @@ func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
 		rp := &fakeReaper{}
 		w := tierWatcher(b, s, h, rp, c)
 
+		seedCursor(t, s, c.at, b.tasks, h.panes) // the verdict was already there
 		if _, err := w.Tick(context.Background()); err != nil {
 			t.Fatalf("first tick: %v", err)
 		}
 		if len(rp.calls) != 0 {
-			t.Fatalf("reap calls = %v; the verdict was already there at baseline", rp.calls)
+			t.Fatalf("reap calls = %v; the verdict was already there in the cursor", rp.calls)
 		}
 		verdictAt = verdictAt.Add(time.Minute)
 		failed.Agent.At = &verdictAt
@@ -325,9 +330,7 @@ func TestAC15OneActionPerClassInGate(t *testing.T) {
 	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
 	w := tierWatcher(b, s, h, &fakeReaper{}, c)
 
-	if _, err := w.Tick(context.Background()); err != nil {
-		t.Fatalf("first tick: %v", err)
-	}
+	seedCursor(t, s, c.at, b.tasks, h.panes)
 
 	b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)}
 	first := tick(t, w, c, 30*time.Second)
@@ -600,9 +603,7 @@ func TestN5UnreadableHarnessSkipsTierOne(t *testing.T) {
 	w := tierWatcher(b, s, h, rp, c)
 	w.Trace = tr
 
-	if _, err := w.Tick(context.Background()); err != nil {
-		t.Fatalf("first tick: %v", err)
-	}
+	seedCursor(t, s, c.at, b.tasks, h.panes)
 	h.listErr = errors.New("herdr unavailable")
 	b.tasks = nil
 	report := tick(t, w, c, 30*time.Second)
@@ -630,4 +631,210 @@ func TestN5UnreadableHarnessSkipsTierOne(t *testing.T) {
 	if len(rp.calls) != 1 || rp.calls[0] != "cap" {
 		t.Fatalf("reap calls = %v, want exactly [cap] once the harness recovered", rp.calls)
 	}
+}
+
+// AC14, baseline: a store with no cursor reaps once for each project whose fs
+// pane is still open. A baseline is a first observation, not a timer: the next
+// tick, with nothing changed, reaps nothing.
+func TestAC14BaselineReapWithoutACursor(t *testing.T) {
+	b := &fakeBoard{tasks: []board.Task{
+		claimedTask("t-1", "cap", "p1", 1, true),
+		claimedTask("t-2", "balcony", "p2", 1, true),
+	}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working"), pane("p2", "claude", "working")}}
+	rp := &fakeReaper{}
+	w := tierWatcher(b, s, h, rp, c)
+
+	first, err := w.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("baseline tick: %v", err)
+	}
+	if len(rp.calls) != 2 {
+		t.Fatalf("baseline reap calls = %v, want one per project with an open pane", rp.calls)
+	}
+	reaps := 0
+	for _, a := range first.Actions {
+		if a.Class == ClassReap && a.Outcome == state.ActionDone {
+			reaps++
+		}
+	}
+	if reaps != 2 {
+		t.Fatalf("actions = %+v, want two done reaps", first.Actions)
+	}
+	if len(h.prompts) != 0 || len(h.closed) != 0 {
+		t.Fatalf("baseline prompted %v or closed %v; only the reap runs", h.prompts, h.closed)
+	}
+
+	second := tick(t, w, c, 30*time.Second)
+	if len(rp.calls) != 2 {
+		t.Fatalf("reap calls = %v; a baseline is not a timer", rp.calls)
+	}
+	if len(second.Actions) != 0 || len(second.Refused) != 0 {
+		t.Fatalf("unchanged tick acted: actions %+v, refused %v", second.Actions, second.Refused)
+	}
+}
+
+func actionLines(tr *captureTrace) []map[string]any {
+	var out []map[string]any
+	for _, e := range tr.events {
+		if e["kind"] == "action" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// wantActionLine returns the trace's single action line of a class and checks
+// the fields AC20 names.
+func wantActionLine(t *testing.T, tr *captureTrace, class string) map[string]any {
+	t.Helper()
+	var got []map[string]any
+	for _, e := range actionLines(tr) {
+		if e["class"] == class {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("trace action lines of class %s = %d, want one: %v", class, len(got), actionLines(tr))
+	}
+	e := got[0]
+	for _, k := range []string{"at", "target", "project", "task", "pane", "trigger", "result"} {
+		if _, ok := e[k]; !ok {
+			t.Fatalf("action line %v has no %q", e, k)
+		}
+	}
+	return e
+}
+
+// AC20: every tier-1 decision writes one action line to the trace — class,
+// target, project, task, pane, trigger and result. A gated repeat writes a
+// refused line; a tick with no decision writes none.
+func TestAC20TierOneDecisionsAreTraced(t *testing.T) {
+	t.Run("reap", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		tr := &captureTrace{}
+		w.Trace = tr
+
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		b.tasks = nil
+		tick(t, w, c, 30*time.Second)
+
+		e := wantActionLine(t, tr, ClassReap)
+		if e["result"] != state.ActionDone || e["project"] != "cap" || e["trigger"] == "" {
+			t.Fatalf("reap line = %v, want done with the project and trigger", e)
+		}
+	})
+
+	t.Run("close", func(t *testing.T) {
+		b := &fakeBoard{}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p-orphan", "claude", "idle")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		tr := &captureTrace{}
+		w.Trace = tr
+
+		if _, err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("first tick: %v", err)
+		}
+		h.panes = []agents.Pane{pane("p-orphan", "", "")}
+		tick(t, w, c, 30*time.Second) // the agent ends; the grace starts
+		tick(t, w, c, 61*time.Second) // the grace elapsed: close
+
+		e := wantActionLine(t, tr, ClassClose)
+		if e["result"] != state.ActionDone || e["target"] != "p-orphan" || e["pane"] != "p-orphan" {
+			t.Fatalf("close line = %v, want done on the pane", e)
+		}
+	})
+
+	t.Run("nudge", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		tr := &captureTrace{}
+		w.Trace = tr
+
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)}
+		tick(t, w, c, 30*time.Second)
+
+		e := wantActionLine(t, tr, ClassNudge)
+		if e["result"] != state.ActionDone || e["task"] != "t-1" || e["pane"] != "p1" {
+			t.Fatalf("nudge line = %v, want done on the task and pane", e)
+		}
+	})
+
+	t.Run("blocked", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		tr := &captureTrace{}
+		w.Trace = tr
+
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		h.panes = []agents.Pane{pane("p1", "claude", "blocked")}
+		tick(t, w, c, 30*time.Second)
+
+		e := wantActionLine(t, tr, ClassBlocked)
+		if e["result"] != state.ActionDone || e["task"] != "t-1" || e["pane"] != "p1" {
+			t.Fatalf("blocked line = %v, want done on the task and pane", e)
+		}
+	})
+
+	t.Run("gate refusal", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		tr := &captureTrace{}
+		w.Trace = tr
+
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)}
+		tick(t, w, c, 30*time.Second) // nudge 1
+		h.panes = []agents.Pane{pane("p1", "claude", "working")}
+		tick(t, w, c, 30*time.Second)
+		h.panes = []agents.Pane{pane("p1", "claude", "idle")}
+		tick(t, w, c, 30*time.Second) // inside the gate: refused
+
+		var refused []map[string]any
+		for _, e := range actionLines(tr) {
+			if e["result"] == actionRefused {
+				refused = append(refused, e)
+			}
+		}
+		if len(refused) != 1 || refused[0]["class"] != ClassNudge {
+			t.Fatalf("refused lines = %v, want one nudge refusal", refused)
+		}
+	})
+
+	t.Run("unchanged tick", func(t *testing.T) {
+		b := &fakeBoard{}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p2", "claude", "working")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		tr := &captureTrace{}
+		w.Trace = tr
+
+		if _, err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("first tick: %v", err)
+		}
+		tick(t, w, c, 30*time.Second)
+
+		if n := len(actionLines(tr)); n != 0 {
+			t.Fatalf("action lines = %d on a tick with no decision: %v", n, actionLines(tr))
+		}
+	})
 }

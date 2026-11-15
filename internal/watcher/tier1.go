@@ -15,9 +15,10 @@ import (
 // Tier-1 action classes. An action triggers only on a transition between the
 // previous cursor and this read, never on elapsed time alone.
 const (
-	ClassReap  = "reap"
-	ClassClose = "close"
-	ClassNudge = "nudge"
+	ClassReap    = "reap"
+	ClassClose   = "close"
+	ClassNudge   = "nudge"
+	ClassBlocked = "blocked"
 
 	// DefaultCloseGrace is how long an empty pane with no launch row must be
 	// seen before cap closes it. A transition starts the timer; the grace only
@@ -41,6 +42,9 @@ func (w *Watcher) closeGrace() time.Duration {
 // agent. A side effect that fails is recorded and reported, not retried.
 // paneBaseline says the previous cursor holds no pane snapshot, so no pane can
 // have moved; the reap keys off the board change instead, and still runs.
+// Without a previous cursor at all there is nothing to compare: the tick is the
+// baseline, and its one act is a reap for every project that still has an fs
+// pane open.
 func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Task, panes []agents.Pane, rows []state.Row, changes []Change, paneBaseline bool) ([]state.Action, []string, error) {
 	actions, err := state.Actions(rows)
 	if err != nil {
@@ -52,6 +56,14 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 	for _, p := range panes {
 		paneByID[p.ID] = p
 	}
+	var baselineReaped map[string]bool
+	if old == nil || paneBaseline {
+		baselineReaped = e.reapBaseline(paneByID)
+	}
+	if old == nil {
+		return e.taken, e.refused, e.err
+	}
+
 	launchByPane := map[string]board.Task{}
 	for _, t := range tasks {
 		if t.Process.Pane != "" {
@@ -125,7 +137,7 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 		}
 	}
 
-	e.reapClosed(changes, paneByID)
+	e.reapClosed(changes, paneByID, baselineReaped)
 	if e.err != nil {
 		return e.taken, e.refused, e.err
 	}
@@ -154,11 +166,40 @@ type engine struct {
 	spoken map[string]bool
 }
 
+// reapBaseline is the first observation's one act: one fs reap for every
+// project that still has an fs launch row whose pane is open in the harness.
+// The cursor cannot witness a round that ended while cap was not running, so
+// the open pane is the evidence. It returns the projects it handled, so the
+// transition reap does not try the same project twice in one tick.
+func (e *engine) reapBaseline(paneByID map[string]agents.Pane) map[string]bool {
+	reaped := map[string]bool{}
+	if e.w.Reap == nil {
+		return reaped
+	}
+	for _, t := range e.tasks {
+		if t.Process.Pane == "" || reaped[t.Project] {
+			continue
+		}
+		if _, open := paneByID[t.Process.Pane]; !open {
+			continue
+		}
+		reaped[t.Project] = true
+		project := t.Project
+		e.perform(state.Action{
+			Class:   ClassReap,
+			Target:  project,
+			Project: project,
+			Trigger: "first read: task " + t.Task + ", pane " + t.Process.Pane + " still open",
+		}, func() error { return e.w.Reap.Reap(e.ctx, project) })
+	}
+	return reaped
+}
+
 // reapClosed calls fs reap once per project whose round just ended while the
 // pane fs launched is still open. fs decides which pane to close; cap notices
 // the transition that ended the round: the task left the board, its lease
 // lapsed, or its session's newest review word became fail or blocked.
-func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
+func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane, baselineReaped map[string]bool) {
 	if e.w.Reap == nil || e.old == nil {
 		return
 	}
@@ -171,7 +212,7 @@ func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
 	var ended []roundEnd
 	reaped := map[string]bool{}
 	add := func(r roundEnd) {
-		if reaped[r.project] {
+		if reaped[r.project] || baselineReaped[r.project] {
 			return
 		}
 		reaped[r.project] = true
@@ -247,24 +288,25 @@ func (e *engine) closeEmpty(p agents.Pane, first time.Time) {
 }
 
 func (e *engine) nudge(t board.Task, p agents.Pane) {
-	target := t.Task
-	if n := state.CountActionsInRound(append(e.actions, e.taken...), ClassNudge, target, t.Round); n >= maxNudgesPerRound {
-		e.refused = append(e.refused, fmt.Sprintf("nudge %s: round %d already nudged %d times", t.Task, t.Round, n))
-		return
-	}
-	text := nudgeText(t)
-	// A pane cap just spoke to is not reaped in the same tick: fs closes an
-	// idle agent whose lease lapsed, and the prod must get its chance to renew.
-	e.spoken[target] = true
-	e.perform(state.Action{
+	a := state.Action{
 		Class:   ClassNudge,
-		Target:  target,
+		Target:  t.Task,
 		Project: t.Project,
 		Task:    t.Task,
 		Pane:    p.ID,
 		Round:   t.Round,
 		Trigger: "lapsed claim, agent idle",
-	}, func() error { return e.w.Agents.Prompt(e.ctx, p.ID, text) })
+	}
+	if n := state.CountActionsInRound(append(e.actions, e.taken...), ClassNudge, a.Target, t.Round); n >= maxNudgesPerRound {
+		e.refused = append(e.refused, fmt.Sprintf("nudge %s: round %d already nudged %d times", t.Task, t.Round, n))
+		e.traceAction(a, actionRefused)
+		return
+	}
+	text := nudgeText(t)
+	// A pane cap just spoke to is not reaped in the same tick: fs closes an
+	// idle agent whose lease lapsed, and the prod must get its chance to renew.
+	e.spoken[a.Target] = true
+	e.perform(a, func() error { return e.w.Agents.Prompt(e.ctx, p.ID, text) })
 }
 
 func nudgeText(t board.Task) string {
@@ -277,27 +319,46 @@ func nudgeText(t board.Task) string {
 }
 
 func (e *engine) blocked(t board.Task, p agents.Pane) {
+	a := state.Action{
+		Class:   ClassBlocked,
+		Target:  t.Task,
+		Project: t.Project,
+		Task:    t.Task,
+		Pane:    p.ID,
+		Trigger: "blocked: agent is waiting on a prompt",
+	}
 	// Announcing a blocked agent must not be undone in the same tick: the
 	// human answers, and the pane waits for that answer.
 	e.spoken[t.Task] = true
-	missing := "blocked: agent is waiting on a prompt"
+	missing := a.Trigger
 	if !e.hasQuestion(t.Task, missing) {
 		if err := e.ask(t.Task, t.Project, state.Scope(t.Project), missing); err != nil {
 			e.err = err
+			e.traceAction(a, state.ActionFailed+": "+err.Error())
 			return
 		}
 	}
 	body := fmt.Sprintf("%s %s — %s (pane %s)", t.Project, t.Task, t.Goal, p.ID)
 	if err := e.w.Agents.Notify(e.ctx, "cap: agent blocked", body); err != nil {
 		e.refused = append(e.refused, "notify "+t.Task+": "+err.Error())
+		e.traceAction(a, state.ActionFailed+": "+err.Error())
+		return
 	}
+	e.traceAction(a, state.ActionDone)
 }
 
 func (e *engine) blockedOrphan(p agents.Pane) {
-	missing := "blocked: agent is waiting on a prompt"
+	a := state.Action{
+		Class:   ClassBlocked,
+		Target:  p.ID,
+		Pane:    p.ID,
+		Trigger: "blocked: agent is waiting on a prompt",
+	}
+	missing := a.Trigger
 	if !e.orphanAsked && !e.hasQuestion("", missing) {
 		if err := e.ask("", "", state.CursorScope, missing); err != nil {
 			e.err = err
+			e.traceAction(a, state.ActionFailed+": "+err.Error())
 			return
 		}
 		e.orphanAsked = true
@@ -305,7 +366,10 @@ func (e *engine) blockedOrphan(p agents.Pane) {
 	body := fmt.Sprintf("unowned agent blocked in %s (pane %s)", p.CWD, p.ID)
 	if err := e.w.Agents.Notify(e.ctx, "cap: agent blocked", body); err != nil {
 		e.refused = append(e.refused, "notify "+p.ID+": "+err.Error())
+		e.traceAction(a, state.ActionFailed+": "+err.Error())
+		return
 	}
+	e.traceAction(a, state.ActionDone)
 }
 
 func (e *engine) hasQuestion(task, missing string) bool {
@@ -338,6 +402,7 @@ func (e *engine) ask(task, project, scope, missing string) error {
 func (e *engine) perform(a state.Action, run func() error) {
 	if g := e.gated(a.Class, a.Target); g != nil {
 		e.refused = append(e.refused, fmt.Sprintf("%s %s: earlier action at %s", a.Class, a.Target, g.At.UTC().Format(time.RFC3339)))
+		e.traceAction(a, actionRefused)
 		return
 	}
 	a.At = e.now
@@ -345,6 +410,7 @@ func (e *engine) perform(a state.Action, run func() error) {
 	id, err := e.put(a)
 	if err != nil {
 		e.err = err
+		e.traceAction(a, state.ActionFailed+": "+err.Error())
 		return
 	}
 	a.ID = id
@@ -352,10 +418,32 @@ func (e *engine) perform(a state.Action, run func() error) {
 		if err := run(); err != nil {
 			e.finish(a, state.ActionFailed+": "+err.Error())
 			e.refused = append(e.refused, a.Class+" "+a.Target+" failed: "+err.Error())
+			e.traceAction(a, state.ActionFailed+": "+err.Error())
 			return
 		}
 	}
 	e.finish(a, state.ActionDone)
+	e.traceAction(a, state.ActionDone)
+}
+
+// actionRefused is the trace result for a decision the gate or a round bound
+// stopped before any side effect.
+const actionRefused = "refused"
+
+// traceAction writes one line per tier-1 decision: its class, what it named,
+// why, and what happened. The trace never gates a decision.
+func (e *engine) traceAction(a state.Action, result string) {
+	e.w.trace(map[string]any{
+		"kind":    "action",
+		"at":      e.now.UTC().Format(time.RFC3339Nano),
+		"class":   a.Class,
+		"target":  a.Target,
+		"project": a.Project,
+		"task":    a.Task,
+		"pane":    a.Pane,
+		"trigger": a.Trigger,
+		"result":  result,
+	})
 }
 
 func (e *engine) gated(class, target string) *state.Action {
