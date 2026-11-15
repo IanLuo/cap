@@ -31,15 +31,16 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **A cleanup loop (tier 1).** On each tick, after the board read and the harness read: call `fs reap` when a round's fs-launched pane is still open; close a pane whose agent ended and no launch row owns, after a 300 s grace; nudge a claimed task whose lease lapsed while its process lives, at most twice per round; record a blocked agent's question and post one notification. The tick never dispatches.
 - **An agent view.** One harness read per tick: pane id, agent status (`working`, `idle`, `blocked`, `done`, `gone`, `unknown`), and whether fs holds a launch row. cap never reads a pane's text.
 - **A supervisor and an operator interface.** `cap watch` runs under launchd with KeepAlive. `cap status`, `cap start`, `cap stop` and `cap logs` let an agent see and control the watcher, each with `--json`. `cap status` and `cap logs` may read the trace; no decision does. None of them launches a task command.
+- **One claimant holds the write verbs.** `cap act`, `cap start` and `cap stop` run only for the session that holds the one open `cap.claim`. Any other session is refused, and the refusal names the holder. An unclaimed or stale cap is claimed only with an explicit `--confirm`. The 30 s clock, `tick`, `logs` and `status` are outside the claim.
 - **Two forms, one boundary.** The watcher is a standalone no-AI process. An on-demand coding-agent interface reads its report and discusses choices. The agent never runs on a clock; the watcher never calls a model.
 
 **Out — and what keeps it out**
 
 - **Not a worker.** No code, no check run, no judgement. *Kept out by:* no working directory, no credentials, no diff is ever read.
 - **Not a dispatcher of work.** No task is dispatched and no agent is started without a named instruction; a command to start work still comes from knowledge. *Kept out by:* the tick path has no dispatch and no knowledge lookup for work. It reaps, closes, nudges, and records.
-- **Not an fs writer.** No task, no report, no claim, no review task. *Kept out by:* fs refuses every task write without a held claim, and cap never claims.
+- **Not an fs writer.** No task, no report, no fs claim, no review task. *Kept out by:* fs refuses every task write without a held claim, and cap never claims there.
 - **Not autonomous over work.** The tick acts only on a state transition between two ticks, one action per task and class per 90 s, each recorded before the side effect. *Kept out by:* class 1 always leaves; an agent pane with no fs launch row is never closed; a blocked agent is never answered.
-- **Not a store.** No database, no queue, no copy of the evidence. *Kept out by:* four kinds of state record in memstore and a local trace log.
+- **Not a store.** No database, no queue, no copy of the evidence. *Kept out by:* five kinds of state record in memstore and a local trace log.
 - **Not a supervisor of workers.** launchd supervises cap; cap supervises rounds. It reaps through fs, nudges a stalled agent at most twice per round, and keeps no worker alive. *Kept out by:* no retry, no transcript read, no fs task write.
 - **Not a scheduler with priorities.** No backlog, no memory between ticks except the cursor. *Kept out by:* a fixed rank and one act per instruction.
 - **Not an author.** No task cards, no specs, no tools, no knowledge edits. *Kept out by:* the ask.
@@ -54,7 +55,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 5. The user names a task. cap searches memstore for kind `knowledge` describing how to dispatch that kind of work in that project.
 6. A command is found: launch it detached in the task's project, write one `cap.act`, return. No command, or two candidates: write one `cap.question`, launch nothing.
 7. The next tick reports whether a holder appeared and updates the record. No auto-retry.
-8. cap holds nothing: no claim, no lease, no pane it owns. It reads panes; it closes only an orphaned agent's empty pane, and only through its own action record.
+8. cap holds nothing in fs: no task claim, no lease, no pane it owns. Its only claim is `cap.claim`, which names the session allowed to run its write verbs. It reads panes; it closes only an orphaned agent's empty pane, and only through its own action record.
 
 ## Acceptance criteria
 
@@ -78,6 +79,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **AC16 · Nudge is bounded.** Given a claimed task with a lapsed lease and a live process, cap prompts the agent with the goal and declared checks, at most twice per round; a working agent is never prompted.
 - **AC17 · An orphan closes only when empty.** Given a pane that held an agent and now has none, with no launch row, cap closes it after the grace period. Given a pane that never held an agent, or a pane that still holds one with no launch row, cap never closes it.
 - **AC18 · Blocked is recorded and announced, never answered.** Given a transition into `blocked`, cap writes one question and posts one notification, sends no prompt and no keys, and writes nothing further while the state does not change.
+- **AC19 · One claimant holds cap.** Given `cap act`, `cap start` or `cap stop`, then it runs only when the caller's session holds an open `cap.claim` whose 120 s lease is live; otherwise it exits non-zero, launches no command, touches no label, and the refusal names the holder and its expiry. Given no open claim, or a claim whose lease has lapsed, then `cap claim --session S --confirm` writes one claim; without `--confirm` nothing is written and the refusal names the state and any earlier holder. Given a live claim by another session, then no claim is written. The holder's `claim`, `act`, `start` and `stop` renew the lease. Given `cap status`, then it names the live holder or, when no claim is live, the last one; it never takes the claim. `tick`, `watch` and `logs` never need a claim.
 
 ## KPIs & failure signal
 
@@ -118,9 +120,10 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
   - `cap.action` — one record per tier-1 act: class (`reap`, `close`, `nudge`), target (project, task, or pane), the observed trigger, time, outcome. Written before the side effect; a failed action closes with the error.
   - `cap.question` — one open record per gap: what is missing, which task needs it, when. A blocked agent is a gap of kind `blocked`.
   - `cap.cursor` — one open record: the last board snapshot (per open task: holder state, lease, newest report time) and the last harness snapshot (per pane: agent status, launch-row presence). Written only when the board or the harness changes.
+  - `cap.claim` — one open record in `cap:cap`: the session that holds cap's write verbs and when its 120 s lease ends. Closed and rewritten on each holder write and on a confirmed takeover. The write verbs and `cap status` read it; no tick decision does.
 - **The board has one source.** cap never reads `fs.*` rows through memstore; those rows are fs's own, and reading them beside knowledge is how a supervisor confuses a task with a fact.
 - **The trace is a file, not a store.** One JSON line per tick and per act in cap's own log, rotated and deleted when large. It never gates a decision and cap never reads it.
-- **Must survive:** the open `cap.act` and `cap.question` records and the newest `cap.action` per task and class, so a restart does not repeat an act, a question or an action. Nothing else.
+- **Must survive:** the open `cap.act`, `cap.question` and `cap.claim` records and the newest `cap.action` per task and class, so a restart does not repeat an act, a question or an action, and a restart does not free the claim of a session that still works. Nothing else.
 - **Empty and edge:** a tick with no change writes nothing. A board with no actable task reports nothing. A task with no `project_path` uses its `parent_dev` task's path; with neither, it cannot be dispatched: cap writes one question naming it. A question closes when a knowledge record answers it. A pane that held an agent and lost it, with no launch row, closes after the grace; a pane that never held an agent, and a pane that still holds one without a launch row, is never closed. A blocked agent gets one question and one notification, and is never answered.
 
 ## Rollback & recovery
@@ -138,7 +141,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 - **Secrets:** a record names an environment variable, never its value. No log line carries a token.
 - **Destructive acts:** bounded. cap closes an orphaned agent's pane and calls `fs reap`; it posts a notification. It never closes a pane that never held an agent, never closes an agent pane without fs's launch row, never answers a blocked agent, never writes fs task state, merges nothing, confirms nothing. Its effects are one command run, one cleanup action, and one state record.
 - **Provenance:** the knowledge id is a field on the `cap.act` record. Nobody walks a link graph; the trace of what ran lives in cap's log.
-- **The worker route:** no guard in V1, said plainly. A worker that runs cap only launches a command for a task that already exists, and fs's claim still arbitrates. If that proves wrong, the guard is a refusal when cap's own environment is a worker's.
+- **The worker route:** a guard, by claim. Any agent may read `status`, `logs` and `tick`. Only the session holding the live `cap.claim` may run `act`, `start` or `stop`, and a takeover of an unclaimed or stale claim needs `--confirm`. The claim coordinates, it does not authenticate: a session id is self-declared, so the guard stops accidental parallel use, not a caller that lies.
 - **Regulatory:** N/A — one user, one machine, local files, no telemetry, no network egress, no personal data.
 
 ## Verification plan
@@ -165,6 +168,7 @@ Type: spec · Owner: cap · Lock state: the marker above, nowhere else
 | AC16 nudge is bounded | a claimed task with a lapsed lease and a live process: at most two prompts per round; a working agent gets none. |
 | AC17 an orphan closes only when empty | an orphaned agent pane with no launch row closes after the grace; a pane that never held an agent, and an agent pane with no launch row, never close. |
 | AC18 blocked is recorded and announced | one question and one notification on the transition; no prompt, no keys, and nothing new while the state holds. |
+| AC19 one claimant holds cap | temp store: `act`, `start` and `stop` with no session, no claim, a foreign live claim, and a stale claim are each refused and name the holder; `claim` without `--confirm` writes nothing while unclaimed or stale, with it writes one; a holder write renews the lease, and a second live session cannot take it; `status` names the holder. |
 | N6 one watcher | fake launchctl: start on a loaded agent issues kickstart, not bootstrap; stop issues one bootout. |
 | N1 clock | time a tick against a slow board fixture. |
 | N3 no reading of work | the fake harness records every call; only list, prompt, close and notify — no `agent read` and no `pane read`. |
