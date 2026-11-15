@@ -53,7 +53,7 @@ nix build .
 - **Rank:** unheld review before unheld dev; then fs's oldest-first task order (preserved as the board returns it). A task with an unconfirmed act younger than 90 s is skipped. A review whose newest review report is `fail` or `blocked` is skipped until its parent dev task reports a `dev-done` newer than that verdict.
 - **Knowledge is never edited by cap.** A dispatch record must name exactly one `cap.dispatch:` command. Zero candidates or two distinct commands raises exactly one question and launches nothing.
 - **The trace is a file, not a store.** One JSON line per tick and per act, rotated at 1 MiB. `cap status` and `cap logs` read it for the operator; no decision does, and it never gates a decision.
-- **The interface controls one label.** `status`, `start`, `stop` and `logs` act on `home-manager.cap` only. They never launch a task command and never read fs. `start` leaves a running watcher running; `stop` bootouts the label. `start`, `stop` and `status` read and write the one `cap.claim` row; `logs` touches no store.
+- **The interface controls one label.** `status`, `start`, `stop` and `logs` act on `home-manager.cap` only. They never launch a task command and never read fs. `start` leaves a running watcher running; `stop` bootouts the label. `start` and `stop` read and write the one `cap.claim` row, and `status` reads it; `logs` touches no store.
 - **One watcher.** The nix module (`homeManagerModules.default`) runs `cap watch` under launchd with KeepAlive. Do not add a second supervisor or a second label.
 
 ## Knowledge record format

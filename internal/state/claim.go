@@ -51,7 +51,8 @@ func (c *Claim) Live(now time.Time) bool {
 }
 
 // ClaimCheck is the gate on a write verb. It returns "" when session may write,
-// else the refusal, which names the holder and its expiry.
+// else the refusal, which names the holder and its expiry. A lapsed claim is
+// stale for every session, including the one that held it.
 func ClaimCheck(cur *Claim, session string, now time.Time) string {
 	if session == "" {
 		return "no cap session: pass --session or set CAP_SESSION"
@@ -59,33 +60,36 @@ func ClaimCheck(cur *Claim, session string, now time.Time) string {
 	switch {
 	case cur == nil:
 		return "cap is unclaimed: run cap claim --session " + session + " --confirm after the user agrees"
-	case cur.Session != session && cur.Live(now):
+	case cur.Live(now) && cur.Session != session:
 		return fmt.Sprintf("cap is held by session %s until %s", cur.Session, cur.Expires.UTC().Format(time.RFC3339))
-	case cur.Session != session:
+	case !cur.Live(now):
 		return fmt.Sprintf("cap is stale, last held by session %s until %s: run cap claim --session %s --confirm to take it over",
 			cur.Session, cur.Expires.UTC().Format(time.RFC3339), session)
-	case !cur.Live(now):
-		return fmt.Sprintf("cap claim for session %s lapsed at %s: run cap claim --session %s",
-			session, cur.Expires.UTC().Format(time.RFC3339), session)
 	}
 	return ""
 }
 
 // DecideClaim says whether a claim attempt may write, and why not. confirm is
-// the user's yes for an unclaimed or stale cap: without it nothing is written,
-// so a takeover is deliberate.
+// the user's yes for an unclaimed or lapsed cap: without it nothing is written,
+// so a takeover — or a holder resuming after its own lease lapsed — is
+// deliberate. Only a live claim by the caller renews without one.
 func DecideClaim(cur *Claim, session string, now time.Time, confirm bool) (allowed bool, reason string) {
 	if session == "" {
 		return false, "no cap session: pass --session or set CAP_SESSION"
 	}
-	switch {
-	case cur == nil && !confirm:
-		return false, "cap is unclaimed: claim it with --confirm after the user agrees"
-	case cur != nil && cur.Session == session:
+	if cur == nil {
+		if !confirm {
+			return false, "cap is unclaimed: claim it with --confirm after the user agrees"
+		}
 		return true, ""
-	case cur.Live(now):
+	}
+	if cur.Session == session && cur.Live(now) {
+		return true, ""
+	}
+	if cur.Live(now) {
 		return false, fmt.Sprintf("cap is held by session %s until %s", cur.Session, cur.Expires.UTC().Format(time.RFC3339))
-	case !confirm:
+	}
+	if !confirm {
 		return false, fmt.Sprintf("cap is stale, last held by session %s until %s: claim it with --confirm to take it over",
 			cur.Session, cur.Expires.UTC().Format(time.RFC3339))
 	}

@@ -20,7 +20,7 @@ func TestClaimCheck(t *testing.T) {
 		{"unclaimed", nil, "b", "cap is unclaimed"},
 		{"held by another", live, "b", "held by session a until 2026-11-15T10:00:30Z"},
 		{"stale to another", stale, "b", "stale, last held by session a"},
-		{"own claim lapsed", stale, "a", "cap claim for session a lapsed"},
+		{"own claim lapsed", stale, "a", "stale, last held by session a"},
 		{"own claim live", live, "a", ""},
 	}
 	for _, c := range cases {
@@ -55,7 +55,8 @@ func TestDecideClaim(t *testing.T) {
 		{"unclaimed without confirm", nil, "a", false, false, "unclaimed"},
 		{"unclaimed with confirm", nil, "a", true, true, ""},
 		{"own live claim renews", live, "a", false, true, ""},
-		{"own stale claim renews", stale, "a", false, true, ""},
+		{"own stale claim without confirm", stale, "a", false, false, "stale, last held by session a"},
+		{"own stale claim with confirm", stale, "a", true, true, ""},
 		{"live holder, confirm changes nothing", live, "b", true, false, "held by session a"},
 		{"stale holder without confirm", stale, "b", false, false, "stale, last held by session a"},
 		{"stale holder with confirm", stale, "b", true, true, ""},

@@ -187,8 +187,41 @@ func TestWriteVerbsRefuseAStaleClaimOfTheirOwn(t *testing.T) {
 	if code := run([]string{"stop"}, &out, &errOut); code != 1 {
 		t.Fatalf("stop exit = %d, want 1", code)
 	}
-	if !strings.Contains(errOut.String(), "lapsed") {
-		t.Fatalf("stderr = %q, want the lapse named", errOut.String())
+	if !strings.Contains(errOut.String(), "stale, last held by session test") {
+		t.Fatalf("stderr = %q, want the stale claim named", errOut.String())
+	}
+}
+
+// AC19: a lapsed claim is stale for its own session too. Resuming after the
+// lease lapsed is a takeover, and it needs the user's yes.
+func TestALapsedOwnClaimNeedsConfirm(t *testing.T) {
+	isolated(t)
+	dbPath := filepath.Join(t.TempDir(), "memory.db")
+	t.Setenv("MEMSTORE_DB", dbPath)
+	seedClaim(t, dbPath, "test", time.Now().Add(-time.Second))
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"claim", "--session", "test"}, &out, &errOut); code != 1 {
+		t.Fatalf("resume exit = %d, want 1; stderr %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "stale") {
+		t.Fatalf("stderr = %q, want the stale refusal", errOut.String())
+	}
+	if n := len(claimRowList(t, dbPath)); n != 1 {
+		t.Fatalf("claims = %d; a refusal writes nothing", n)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"claim", "--session", "test", "--confirm"}, &out, &errOut); code != 0 {
+		t.Fatalf("confirmed resume exit = %d, stderr %s", code, errOut.String())
+	}
+	cur, err := state.OpenClaim(claimRowList(t, dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil || cur.Session != "test" || !cur.Live(time.Now()) {
+		t.Fatalf("claim = %+v, want test holding a live lease", cur)
 	}
 }
 
