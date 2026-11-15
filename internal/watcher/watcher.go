@@ -1,11 +1,13 @@
 // Package watcher is cap's two forms and one boundary. Watcher.Tick reads the
-// board and never holds a launcher. Dispatcher.Act runs one named instruction.
-// The clock path therefore cannot launch anything, by construction.
+// board and the harness and takes tier-1 cleanup actions; it never dispatches.
+// Dispatcher.Act runs one named instruction. Work therefore starts only on an
+// instruction, by construction.
 package watcher
 
 import (
 	"time"
 
+	"github.com/IanLuo/cap/internal/agents"
 	"github.com/IanLuo/cap/internal/board"
 	"github.com/IanLuo/cap/internal/state"
 )
@@ -36,13 +38,18 @@ type Launcher interface {
 	Launch(dir, command string) error
 }
 
-// Watcher is the clock path. It has no Launcher field: a tick cannot launch.
+// Watcher is the clock path. It has no Launcher field: a tick cannot start
+// work. Its only side effects are the tier-1 actions, each gated and recorded
+// before it runs.
 type Watcher struct {
-	Board board.Reader
-	Store state.Store
-	Trace Trace
-	Now   func() time.Time
-	Gate  time.Duration
+	Board      board.Reader
+	Reap       board.Reaper
+	Agents     agents.Harness
+	Store      state.Store
+	Trace      Trace
+	Now        func() time.Time
+	Gate       time.Duration
+	CloseGrace time.Duration
 }
 
 // Dispatcher is the on-demand path: one task the user named, one command.
@@ -96,10 +103,10 @@ func (d *Dispatcher) trace(event map[string]any) {
 }
 
 // listRows returns one row listing per cap:<project> scope in view: every
-// project on the board, plus every project the previous cursor knew, so a task
-// that just closed is still reconciled.
+// project on the board, every project the previous cursor knew, and cap's own
+// board-wide scope so an orphan pane's question is visible.
 func listRows(s state.Store, tasks []board.Task, cursor *state.Cursor) ([]state.Row, error) {
-	scopes := map[string]bool{}
+	scopes := map[string]bool{state.CursorScope: true}
 	for _, t := range tasks {
 		scopes[state.Scope(t.Project)] = true
 	}

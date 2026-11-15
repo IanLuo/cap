@@ -20,6 +20,8 @@ type reportJSON struct {
 	Confirmed       []state.Act          `json:"confirmed"`
 	Pending         []state.Act          `json:"pending"`
 	Recommendations []recommendationJSON `json:"recommendations"`
+	Actions         []state.Action       `json:"actions"`
+	Refused         []string             `json:"refused"`
 }
 
 type changeJSON struct {
@@ -82,12 +84,20 @@ func newReport(r watcher.Report) reportJSON {
 		Confirmed:       r.Confirmed,
 		Pending:         r.Pending,
 		Recommendations: make([]recommendationJSON, 0, len(r.Recommendations)),
+		Actions:         r.Actions,
+		Refused:         r.Refused,
 	}
 	if out.Confirmed == nil {
 		out.Confirmed = []state.Act{}
 	}
 	if out.Pending == nil {
 		out.Pending = []state.Act{}
+	}
+	if out.Actions == nil {
+		out.Actions = []state.Action{}
+	}
+	if out.Refused == nil {
+		out.Refused = []string{}
 	}
 	for _, c := range r.Changes {
 		out.Changes = append(out.Changes, changeJSON{Task: c.Task, Project: c.Project, Reason: c.Reason})

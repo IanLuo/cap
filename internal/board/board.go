@@ -30,7 +30,18 @@ type Task struct {
 	LeaseLive    bool       `json:"lease_live"`
 	Agent        Observed   `json:"agent"`
 	Runtime      Observed   `json:"runtime"`
+	Process      Process    `json:"process"`
 	Evidence     []Evidence `json:"evidence,omitempty"`
+}
+
+// Process is what fs's launcher recorded for a task: one process fs started.
+// Status is working, idle, gone, or unknown. Pane and Name are empty when fs
+// holds no launch row for the task.
+type Process struct {
+	Status   string     `json:"status"`
+	Pane     string     `json:"pane,omitempty"`
+	Name     string     `json:"name,omitempty"`
+	Launched *time.Time `json:"launched,omitempty"`
 }
 
 // Observed is what fs's status says an agent or runtime last reported.
@@ -59,6 +70,12 @@ type Evidence struct {
 // method, so a test can count reads and a fake can never be asked to write.
 type Reader interface {
 	Status(context.Context) ([]Task, error)
+}
+
+// Reaper asks fs to close the agents it launched for a project whose round is
+// over. cap never closes an fs-launched pane itself; fs closes its own.
+type Reaper interface {
+	Reap(ctx context.Context, project string) error
 }
 
 // Client runs exactly one `fs status` over every project.
@@ -118,4 +135,42 @@ func Decode(out []byte) ([]Task, error) {
 		}
 	}
 	return tasks, nil
+}
+
+// Reap runs one `fs reap --project`, fs's own cleanup of the agents it started.
+func (c Client) Reap(ctx context.Context, project string) error {
+	bin := c.Bin
+	if bin == "" {
+		bin = "fs"
+	}
+	cmd := exec.CommandContext(ctx, bin, "reap", "--project", project)
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			msg := strings.TrimSpace(string(ee.Stderr))
+			if msg != "" {
+				return fmt.Errorf("%s reap --project %s: %w: %s", bin, project, err, msg)
+			}
+		}
+		return fmt.Errorf("%s reap --project %s: %w", bin, project, err)
+	}
+	return decodeReap(out)
+}
+
+// decodeReap refuses a reap that answered with a refusal envelope.
+func decodeReap(out []byte) error {
+	var env struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		return fmt.Errorf("decode fs reap: %w", err)
+	}
+	if !env.OK {
+		if env.Error != "" {
+			return fmt.Errorf("fs reap refused: %s", env.Error)
+		}
+		return fmt.Errorf("fs reap returned no ok envelope")
+	}
+	return nil
 }

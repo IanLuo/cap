@@ -252,6 +252,7 @@ func TestTickJSON(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("MEMSTORE_DB", filepath.Join(dir, "memory.db"))
 	t.Setenv("CAP_TRACE", filepath.Join(dir, "trace.log"))
+	t.Setenv("CAP_HERDR_BIN", fakeHerdr(t))
 	t.Setenv("CAP_FS_BIN", writeExec(t, "fs", `cat <<'JSON'
 {"ok":true,"data":{"projects":[{"project":"p","tasks":[{"task":"t-1","kind":"dev","state":"open","goal":"g","checks":["c"]}]}]}}
 JSON`))

@@ -1,8 +1,9 @@
 // Command cap is the coordinator's watcher and advisor. `cap tick` reads the
-// board and never launches. `cap act <task>` runs one instruction. `cap watch`
-// repeats the tick on the 30 s clock. `cap status`, `start`, `stop` and `logs`
-// are the operator interface around the supervised watcher: they control
-// cap's own launchd label and never launch a task command.
+// board and the harness, takes tier-1 cleanup, and never launches. `cap act
+// <task>` runs one instruction. `cap watch` repeats the tick on the 30 s clock.
+// `cap status`, `start`, `stop` and `logs` are the operator interface around the
+// supervised watcher: they control cap's own launchd label and never launch a
+// task command.
 package main
 
 import (
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/IanLuo/cap/internal/agents"
 	"github.com/IanLuo/cap/internal/board"
 	"github.com/IanLuo/cap/internal/launch"
 	"github.com/IanLuo/cap/internal/service"
@@ -147,7 +149,7 @@ func tickCmd(o options, stdout, stderr io.Writer) int {
 	}
 	defer store.CloseDB()
 
-	w := &watcher.Watcher{Board: board.Client{Bin: fsBin()}, Store: store, Trace: log}
+	w := newWatcher(store, log)
 	report, err := w.Tick(context.Background())
 	if err != nil {
 		log.Write(map[string]any{"kind": "tick", "at": time.Now().UTC().Format(time.RFC3339Nano), "result": "error", "error": err.Error()})
@@ -165,7 +167,7 @@ func watchCmd(o options, stdout, stderr io.Writer) int {
 	}
 	defer store.CloseDB()
 
-	w := &watcher.Watcher{Board: board.Client{Bin: fsBin()}, Store: store, Trace: log}
+	w := newWatcher(store, log)
 	ticker := time.NewTicker(watcher.DefaultInterval)
 	defer ticker.Stop()
 	for {
@@ -308,11 +310,31 @@ func open() (*state.MemStore, *trace.Log, error) {
 	return store, trace.Open(tracePath()), nil
 }
 
+// newWatcher wires the clock path: one board read, one harness read, one reap
+// call. It has no launcher, so a tick cannot start work.
+func newWatcher(store *state.MemStore, log *trace.Log) *watcher.Watcher {
+	fs := board.Client{Bin: fsBin()}
+	return &watcher.Watcher{
+		Board:  fs,
+		Reap:   fs,
+		Agents: agents.Herdr{Bin: herdrBin()},
+		Store:  store,
+		Trace:  log,
+	}
+}
+
 func fsBin() string {
 	if v := os.Getenv("CAP_FS_BIN"); v != "" {
 		return v
 	}
 	return "fs"
+}
+
+func herdrBin() string {
+	if v := os.Getenv("CAP_HERDR_BIN"); v != "" {
+		return v
+	}
+	return "herdr"
 }
 
 func tracePath() string {
@@ -329,7 +351,7 @@ func tracePath() string {
 func usage(w io.Writer) {
 	fmt.Fprint(w, `usage: cap <command> [--json]
 
-  cap tick            one board read: report changes and the ranked next tasks
+  cap tick            one board and harness read: report, clean up, rank next
   cap watch           repeat the tick every 30 s (supervised by launchd)
   cap act <task>      run one instruction for a named task
   cap status          watcher state: running, pid, last tick, last error
@@ -339,10 +361,12 @@ func usage(w io.Writer) {
 
   --json              one JSON object per call, one per tick for watch
 
-The board comes from "fs status" only. cap writes nothing in fs and never
-holds a claim. State is in memstore scopes cap:<project>; the trace is a file
-at $CAP_TRACE (default ~/.cap/trace.log). The store is $MEMSTORE_DB, else
-~/.memstore/memory.db. Set $CAP_FS_BIN to name the fs binary. The service is
+The board comes from "fs status" only, and the agent view from "herdr pane
+list". cap writes nothing in fs and never holds a claim; its tier-1 cleanup
+calls fs reap and herdr, and never starts work. State is in memstore scopes
+cap:<project>; the trace is a file at $CAP_TRACE (default ~/.cap/trace.log).
+The store is $MEMSTORE_DB, else ~/.memstore/memory.db. Set $CAP_FS_BIN to name
+the fs binary and $CAP_HERDR_BIN to name the herdr binary. The service is
 $CAP_SERVICE_LABEL (default home-manager.cap); $CAP_LAUNCHCTL names launchctl.
 `)
 }

@@ -40,23 +40,62 @@ type Question struct {
 	At      time.Time `json:"at"`
 }
 
-// Cursor is the last board snapshot. It is written only when the board changes,
-// and there is at most one open cursor.
+// Cursor is the last board and harness snapshot. It is written only when the
+// board or the harness changes, and there is at most one open cursor.
 type Cursor struct {
 	ID    int64        `json:"-"`
 	At    time.Time    `json:"at"`
 	Tasks []CursorTask `json:"tasks"`
+	Panes []CursorPane `json:"panes,omitempty"`
 }
 
+// CursorPane is one pane's comparison fields: the agent it runs, its state, the
+// tick it was first seen in that class, and whether it has ever run an agent.
+// First anchors the close grace period, so a pane is never closed on elapsed
+// time alone. WasAgent marks an orphan: a pane that held an agent and lost it.
+// A pane that never held one is a human terminal, never cap's to close.
+type CursorPane struct {
+	Pane     string    `json:"pane"`
+	Agent    string    `json:"agent,omitempty"`
+	Status   string    `json:"status"`
+	CWD      string    `json:"cwd,omitempty"`
+	First    time.Time `json:"first"`
+	WasAgent bool      `json:"was_agent,omitempty"`
+}
+
+// Action is one tier-1 act: what cap did without an instruction, why, to what,
+// and when. It is written before the side effect; a later row carries the
+// outcome. One action per class and target per gate.
+type Action struct {
+	ID      int64     `json:"-"`
+	Class   string    `json:"class"`
+	Target  string    `json:"target"`
+	Project string    `json:"project,omitempty"`
+	Task    string    `json:"task,omitempty"`
+	Pane    string    `json:"pane,omitempty"`
+	Round   int       `json:"round,omitempty"`
+	Trigger string    `json:"trigger"`
+	At      time.Time `json:"at"`
+	Outcome string    `json:"outcome"`
+}
+
+// The two action outcomes. An action starts attempted; it ends done or failed.
+const (
+	ActionAttempted = "attempted"
+	ActionDone      = "done"
+	ActionFailed    = "failed"
+)
+
 // CursorTask is one open task's comparison fields: holder state, lease, newest
-// report time. Project is identity, carried so a later tick knows which cap:
-// scopes to read.
+// report time, and the pane fs launched for it. Project is identity, carried so
+// a later tick knows which cap: scopes to read.
 type CursorTask struct {
 	Task         string     `json:"task"`
 	Project      string     `json:"project"`
 	Kind         string     `json:"kind"`
 	State        string     `json:"state"`
 	Session      string     `json:"session,omitempty"`
+	Pane         string     `json:"pane,omitempty"`
 	LeaseExpires *time.Time `json:"lease_expires,omitempty"`
 	LeaseLive    bool       `json:"lease_live"`
 	NewestReport *time.Time `json:"newest_report,omitempty"`
@@ -89,6 +128,76 @@ func DecodeQuestion(r Row) (Question, error) {
 	}
 	q.ID = r.ID
 	return q, nil
+}
+
+// DecodeAction reads one cap.action row.
+func DecodeAction(r Row) (Action, error) {
+	var a Action
+	if err := json.Unmarshal([]byte(r.Text), &a); err != nil {
+		return Action{}, fmt.Errorf("decode cap.action %d: %w", r.ID, err)
+	}
+	a.ID = r.ID
+	return a, nil
+}
+
+// Actions returns every action row, newest first.
+func Actions(rows []Row) ([]Action, error) {
+	var out []Action
+	for _, r := range rows {
+		if r.Kind != KindAction {
+			continue
+		}
+		a, err := DecodeAction(r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// LatestAction returns the newest action for one class and target, or nil.
+// Ties break on row id so the answer is deterministic.
+func LatestAction(actions []Action, class, target string) *Action {
+	var latest *Action
+	for i := range actions {
+		a := &actions[i]
+		if a.Class != class || a.Target != target {
+			continue
+		}
+		if latest == nil || a.At.After(latest.At) || (a.At.Equal(latest.At) && a.ID > latest.ID) {
+			latest = a
+		}
+	}
+	return latest
+}
+
+// LatestActionInRound returns the newest action for one class and target in one
+// fs round. It bounds a nudge to two per round across restarts.
+func LatestActionInRound(actions []Action, class, target string, round int) *Action {
+	var latest *Action
+	for i := range actions {
+		a := &actions[i]
+		if a.Class != class || a.Target != target || a.Round != round {
+			continue
+		}
+		if latest == nil || a.At.After(latest.At) || (a.At.Equal(latest.At) && a.ID > latest.ID) {
+			latest = a
+		}
+	}
+	return latest
+}
+
+// CountActionsInRound counts completed actions for one class, target and round.
+// The attempted row of a finished action is history, not a second action.
+func CountActionsInRound(actions []Action, class, target string, round int) int {
+	n := 0
+	for _, a := range actions {
+		if a.Class == class && a.Target == target && a.Round == round && a.Outcome != ActionAttempted {
+			n++
+		}
+	}
+	return n
 }
 
 // DecodeCursor reads one cap.cursor row.

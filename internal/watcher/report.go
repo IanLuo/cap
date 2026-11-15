@@ -10,8 +10,8 @@ import (
 )
 
 // Report is what one tick says: what changed, which acts were confirmed, which
-// are still unconfirmed, and what cap would work on next. It is text; the
-// watcher has no model client.
+// are still unconfirmed, what tier-1 actions ran or were refused, and what cap
+// would work on next. It is text; the watcher has no model client.
 type Report struct {
 	At              time.Time
 	Changed         bool
@@ -19,6 +19,8 @@ type Report struct {
 	Confirmed       []state.Act
 	Pending         []state.Act
 	Recommendations []Recommendation
+	Actions         []state.Action
+	Refused         []string
 }
 
 // Change is one task whose holder state, lease, or newest report moved.
@@ -95,6 +97,18 @@ func (r Report) String() string {
 		for _, a := range r.Pending {
 			fmt.Fprintf(&b, "  %s %s: launched %s by knowledge %s; no holder yet\n",
 				a.Task, a.Project, a.LaunchedAt.UTC().Format(time.RFC3339), a.Knowledge)
+		}
+	}
+	if len(r.Actions) > 0 {
+		b.WriteString("actions:\n")
+		for _, a := range r.Actions {
+			fmt.Fprintf(&b, "  %s %s: %s -> %s\n", a.Class, a.Target, a.Trigger, a.Outcome)
+		}
+	}
+	if len(r.Refused) > 0 {
+		b.WriteString("refused:\n")
+		for _, s := range r.Refused {
+			fmt.Fprintf(&b, "  %s\n", s)
 		}
 	}
 	return b.String()

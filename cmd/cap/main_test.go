@@ -17,9 +17,21 @@ func writeScript(t *testing.T, body string) string {
 	return path
 }
 
+// fakeHerdr answers one empty pane list, so a tick test never reads the user's
+// real harness.
+func fakeHerdr(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "herdr")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\ncat <<'JSON'\n{\"result\":{\"panes\":[]}}\nJSON\n"), 0o755); err != nil {
+		t.Fatalf("write fake herdr: %v", err)
+	}
+	return path
+}
+
 func TestTickCommandReportsBoardChanges(t *testing.T) {
 	t.Setenv("MEMSTORE_DB", filepath.Join(t.TempDir(), "memory.db"))
 	t.Setenv("CAP_TRACE", filepath.Join(t.TempDir(), "trace.log"))
+	t.Setenv("CAP_HERDR_BIN", fakeHerdr(t))
 	t.Setenv("CAP_FS_BIN", writeScript(t, `cat <<'JSON'
 {"ok":true,"data":{"projects":[{"project":"p","tasks":[{"task":"t-1","kind":"dev","state":"open","goal":"g","checks":["c"]}]}]}}
 JSON`))

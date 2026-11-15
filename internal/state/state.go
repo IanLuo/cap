@@ -1,4 +1,4 @@
-// Package state is cap's own memory: the three record kinds it owns, and the
+// Package state is cap's own memory: the four record kinds it owns, and the
 // only place that talks to memstore. It refuses any scope that is not cap's, so
 // the fs board can never be read through this package.
 package state
@@ -14,6 +14,7 @@ import (
 
 const (
 	KindAct      = "cap.act"
+	KindAction   = "cap.action"
 	KindQuestion = "cap.question"
 	KindCursor   = "cap.cursor"
 
@@ -91,8 +92,8 @@ func (m *MemStore) Put(kind, scope, title, text string) (int64, error) {
 	if !strings.HasPrefix(scope, "cap:") {
 		return 0, fmt.Errorf("cap writes only cap: scopes, got %q", scope)
 	}
-	if kind != KindAct && kind != KindQuestion && kind != KindCursor {
-		return 0, fmt.Errorf("cap owns three kinds, not %q", kind)
+	if kind != KindAct && kind != KindAction && kind != KindQuestion && kind != KindCursor {
+		return 0, fmt.Errorf("cap owns four kinds, not %q", kind)
 	}
 	return m.db.Put(&memstore.Memory{Kind: kind, Scope: scope, Title: title, Text: text, Origin: "cap"})
 }

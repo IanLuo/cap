@@ -7,12 +7,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/IanLuo/cap/internal/agents"
 	"github.com/IanLuo/cap/internal/board"
 	"github.com/IanLuo/cap/internal/state"
 )
 
-// Tick is the whole clock path: one board read, a comparison, the report, and
-// at most one cursor write. It never launches anything; Watcher has no launcher.
+// Tick is the whole clock path: one board read, one harness read, a
+// comparison, tier-1 cleanup, the report, and at most one cursor write. It
+// never launches anything; Watcher has no launcher.
 func (w *Watcher) Tick(ctx context.Context) (Report, error) {
 	now := w.now()
 	report := Report{At: now}
@@ -73,9 +75,42 @@ func (w *Watcher) Tick(ctx context.Context) (Report, error) {
 			return report, err
 		}
 		report.Recommendations = recs
-		// The cursor is last: a failed knowledge read must leave the board
-		// looking changed, so the next tick retries the recommendation.
-		if err := w.writeCursor(cursorRows, next, now); err != nil {
+	}
+
+	// One harness read, tier 1 only. An unreadable harness skips tier 1 for
+	// this tick; it never stops the board read or the report.
+	var panes []agents.Pane
+	harnessOK := false
+	if w.Agents != nil {
+		panes, err = w.Agents.List(ctx)
+		if err != nil {
+			w.trace(map[string]any{
+				"kind": "tick", "at": now.UTC().Format(time.RFC3339Nano),
+				"harness": "error", "error": err.Error(),
+			})
+		} else {
+			harnessOK = true
+		}
+	}
+	if old != nil && harnessOK {
+		actions, refused, err := w.tier1(ctx, old, tasks, panes, rows, report.Changes)
+		if err != nil {
+			return report, err
+		}
+		report.Actions = actions
+		report.Refused = refused
+	}
+
+	nextPanes := oldPanes(old)
+	if harnessOK {
+		nextPanes = paneSnapshot(panes, old, now)
+	}
+	panesChanged := harnessOK && (old == nil || !samePanes(old.Panes, nextPanes))
+
+	// The cursor is last: a failed knowledge read must leave the board looking
+	// changed, so the next tick retries the recommendation.
+	if report.Changed || panesChanged {
+		if err := w.writeCursor(cursorRows, next, nextPanes, now); err != nil {
 			return report, err
 		}
 	}
@@ -88,8 +123,16 @@ func (w *Watcher) Tick(ctx context.Context) (Report, error) {
 		"confirmed":       len(report.Confirmed),
 		"pending":         len(report.Pending),
 		"recommendations": len(report.Recommendations),
+		"actions":         len(report.Actions),
 	})
 	return report, nil
+}
+
+func oldPanes(old *state.Cursor) []state.CursorPane {
+	if old == nil {
+		return nil
+	}
+	return old.Panes
 }
 
 func (w *Watcher) rewriteAct(old, updated state.Act) error {
@@ -106,7 +149,7 @@ func (w *Watcher) rewriteAct(old, updated state.Act) error {
 	return nil
 }
 
-func (w *Watcher) writeCursor(existing []state.Row, tasks []state.CursorTask, at time.Time) error {
+func (w *Watcher) writeCursor(existing []state.Row, tasks []state.CursorTask, panes []state.CursorPane, at time.Time) error {
 	for _, r := range existing {
 		if r.Kind == state.KindCursor && !r.Closed {
 			if err := w.Store.Close(r.ID); err != nil {
@@ -114,7 +157,7 @@ func (w *Watcher) writeCursor(existing []state.Row, tasks []state.CursorTask, at
 			}
 		}
 	}
-	text, err := state.Encode(state.Cursor{At: at, Tasks: tasks})
+	text, err := state.Encode(state.Cursor{At: at, Tasks: tasks, Panes: panes})
 	if err != nil {
 		return err
 	}
@@ -138,6 +181,7 @@ func snapshot(tasks []board.Task) []state.CursorTask {
 			Kind:         t.Kind,
 			State:        t.State,
 			Session:      t.Session,
+			Pane:         t.Process.Pane,
 			LeaseExpires: t.LeaseExpires,
 			LeaseLive:    t.LeaseLive,
 			NewestReport: newestReport(t),
