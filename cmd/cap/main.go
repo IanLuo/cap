@@ -32,9 +32,11 @@ func main() {
 
 // options are the flags every verb accepts.
 type options struct {
-	json bool
-	tail int
-	args []string
+	json    bool
+	tail    int
+	confirm bool
+	session string
+	args    []string
 }
 
 func parseOpts(args []string) (options, error) {
@@ -44,6 +46,19 @@ func parseOpts(args []string) (options, error) {
 		switch {
 		case a == "--json":
 			o.json = true
+		case a == "--confirm":
+			o.confirm = true
+		case a == "--session":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--session needs an id")
+			}
+			i++
+			o.session = args[i]
+		case strings.HasPrefix(a, "--session="):
+			o.session = strings.TrimPrefix(a, "--session=")
+			if o.session == "" {
+				return o, fmt.Errorf("--session needs an id")
+			}
 		case a == "--tail":
 			if i+1 >= len(args) {
 				return o, fmt.Errorf("--tail needs a number")
@@ -108,6 +123,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return actCmd(opts.args[0], opts, stdout, stderr)
+	case "claim":
+		if len(opts.args) != 0 {
+			usage(stderr)
+			return 2
+		}
+		return claimCmd(opts, stdout, stderr)
 	case "status":
 		if len(opts.args) != 0 {
 			usage(stderr)
@@ -190,6 +211,11 @@ func actCmd(tid string, o options, stdout, stderr io.Writer) int {
 	}
 	defer store.CloseDB()
 
+	if err := takeClaim(store, o.claimSession(), time.Now()); err != nil {
+		fmt.Fprintf(stderr, "cap: %v\n", err)
+		return 1
+	}
+
 	d := &watcher.Dispatcher{Board: board.Client{Bin: fsBin()}, Store: store, Launcher: launch.Detached{}, Trace: log}
 	result, err := d.Act(context.Background(), tid)
 	if err != nil {
@@ -219,7 +245,18 @@ func statusCmd(o options, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "cap: read trace: %v\n", err)
 		return 1
 	}
-	s := newStatus(svc, st, events, time.Now())
+	store, err := state.Open("")
+	if err != nil {
+		fmt.Fprintf(stderr, "cap: %v\n", err)
+		return 1
+	}
+	claim, err := openClaim(store)
+	store.CloseDB()
+	if err != nil {
+		fmt.Fprintf(stderr, "cap: %v\n", err)
+		return 1
+	}
+	s := newStatus(svc, st, events, time.Now(), claim)
 	if o.json {
 		return emitJSON(stdout, stderr, s)
 	}
@@ -227,9 +264,28 @@ func statusCmd(o options, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// gated is the claim gate for the operator verbs: `start` and `stop` run only
+// for the session that holds cap. It renews the holder's lease.
+func gated(o options, stderr io.Writer) int {
+	store, err := state.Open("")
+	if err != nil {
+		fmt.Fprintf(stderr, "cap: %v\n", err)
+		return 1
+	}
+	defer store.CloseDB()
+	if err := takeClaim(store, o.claimSession(), time.Now()); err != nil {
+		fmt.Fprintf(stderr, "cap: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 func startCmd(o options, stdout, stderr io.Writer) int {
 	ctx := context.Background()
 	svc := service.New()
+	if code := gated(o, stderr); code != 0 {
+		return code
+	}
 	if err := svc.Start(ctx); err != nil {
 		fmt.Fprintf(stderr, "cap: %v\n", err)
 		return 1
@@ -250,6 +306,9 @@ func startCmd(o options, stdout, stderr io.Writer) int {
 func stopCmd(o options, stdout, stderr io.Writer) int {
 	ctx := context.Background()
 	svc := service.New()
+	if code := gated(o, stderr); code != 0 {
+		return code
+	}
 	if err := svc.Stop(ctx); err != nil {
 		fmt.Fprintf(stderr, "cap: %v\n", err)
 		return 1
@@ -353,20 +412,25 @@ func usage(w io.Writer) {
 
   cap tick            one board and harness read: report, clean up, rank next
   cap watch           repeat the tick every 30 s (supervised by launchd)
-  cap act <task>      run one instruction for a named task
-  cap status          watcher state: running, pid, last tick, last error
-  cap start           start the watcher's launchd agent
-  cap stop            stop the watcher's launchd agent
+  cap act <task>      run one instruction for a named task (needs the claim)
+  cap claim           take or renew the claim on cap's write verbs
+  cap status          watcher state: running, pid, last tick, last error, claim
+  cap start           start the watcher's launchd agent (needs the claim)
+  cap stop            stop the watcher's launchd agent (needs the claim)
   cap logs [--tail N] print the last N trace events (default 50)
 
   --json              one JSON object per call, one per tick for watch
+  --session S         the caller's identity (default $CAP_SESSION)
+  --confirm           take an unclaimed or stale cap; the user must agree first
 
 The board comes from "fs status" only, and the agent view from "herdr pane
-list". cap writes nothing in fs and never holds a claim; its tier-1 cleanup
-calls fs reap and herdr, and never starts work. State is in memstore scopes
-cap:<project>; the trace is a file at $CAP_TRACE (default ~/.cap/trace.log).
-The store is $MEMSTORE_DB, else ~/.memstore/memory.db. Set $CAP_FS_BIN to name
-the fs binary and $CAP_HERDR_BIN to name the herdr binary. The service is
-$CAP_SERVICE_LABEL (default home-manager.cap); $CAP_LAUNCHCTL names launchctl.
+list". cap writes nothing in fs and never claims there; its tier-1 cleanup
+calls fs reap and herdr, and never starts work. One session holds the cap
+claim; act, start and stop refuse any other session. State is in memstore
+scopes cap:<project>; the trace is a file at $CAP_TRACE (default
+~/.cap/trace.log). The store is $MEMSTORE_DB, else ~/.memstore/memory.db. Set
+$CAP_FS_BIN to name the fs binary and $CAP_HERDR_BIN to name the herdr binary.
+The service is $CAP_SERVICE_LABEL (default home-manager.cap); $CAP_LAUNCHCTL
+names launchctl.
 `)
 }

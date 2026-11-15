@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IanLuo/cap/internal/state"
 	"github.com/IanLuo/memstore"
 )
 
@@ -52,6 +53,24 @@ func argvLogLines(t *testing.T, path string) []string {
 	return strings.Split(strings.TrimSpace(string(raw)), "\n")
 }
 
+// claimFor takes cap's write verbs in the test's store, as a skill does after
+// the user agrees. It needs MEMSTORE_DB set to a temp file.
+func claimFor(t *testing.T, session string) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	if code := run([]string{"claim", "--session", session, "--confirm"}, &out, &errOut); code != 0 {
+		t.Fatalf("claim: %s", errOut.String())
+	}
+}
+
+// isolated points the store and the session at a temp file. Every test that
+// runs a write verb or status calls it first.
+func isolated(t *testing.T) {
+	t.Helper()
+	t.Setenv("MEMSTORE_DB", filepath.Join(t.TempDir(), "memory.db"))
+	t.Setenv("CAP_SESSION", "test")
+}
+
 func TestStatusJSONReportsRunning(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state")
 	if err := os.WriteFile(state, []byte("\tpid = 4242\n"), 0o644); err != nil {
@@ -65,6 +84,8 @@ func TestStatusJSONReportsRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("CAP_TRACE", traceFile)
+	isolated(t)
+	claimFor(t, "test")
 
 	var out, errOut bytes.Buffer
 	if code := run([]string{"status", "--json"}, &out, &errOut); code != 0 {
@@ -80,11 +101,15 @@ func TestStatusJSONReportsRunning(t *testing.T) {
 	if got.LastTickAt != at || got.Stale || got.LastError != "" {
 		t.Fatalf("status = %+v, want the fresh tick and no error", got)
 	}
+	if !got.Claim.Held || got.Claim.Session != "test" {
+		t.Fatalf("status claim = %+v, want test holding", got.Claim)
+	}
 }
 
 func TestStatusCallsStoppedAtNoSuchService(t *testing.T) {
 	t.Setenv("CAP_LAUNCHCTL", fakeLaunchctl(t, filepath.Join(t.TempDir(), "absent"), filepath.Join(t.TempDir(), "argv.log")))
 	t.Setenv("CAP_TRACE", filepath.Join(t.TempDir(), "trace.log"))
+	isolated(t)
 
 	var out, errOut bytes.Buffer
 	if code := run([]string{"status"}, &out, &errOut); code != 0 {
@@ -92,6 +117,9 @@ func TestStatusCallsStoppedAtNoSuchService(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "stopped") {
 		t.Fatalf("status = %q, want stopped", out.String())
+	}
+	if !strings.Contains(out.String(), "cap claim: none") {
+		t.Fatalf("status = %q, want the claim line", out.String())
 	}
 }
 
@@ -106,6 +134,8 @@ func TestStartBootstrapsWhenStopped(t *testing.T) {
 	t.Setenv("CAP_SERVICE_PLIST", plist)
 	t.Setenv("CAP_SERVICE_LABEL", "home-manager.cap")
 	t.Setenv("CAP_TRACE", filepath.Join(dir, "trace.log"))
+	isolated(t)
+	claimFor(t, "test")
 
 	var out, errOut bytes.Buffer
 	if code := run([]string{"start", "--json"}, &out, &errOut); code != 0 {
@@ -133,6 +163,8 @@ func TestStartLeavesRunningWatcherAlone(t *testing.T) {
 	argvLog := filepath.Join(dir, "argv.log")
 	t.Setenv("CAP_LAUNCHCTL", fakeLaunchctl(t, state, argvLog))
 	t.Setenv("CAP_TRACE", filepath.Join(dir, "trace.log"))
+	isolated(t)
+	claimFor(t, "test")
 
 	var out, errOut bytes.Buffer
 	if code := run([]string{"start", "--json"}, &out, &errOut); code != 0 {
@@ -157,6 +189,8 @@ func TestStartKicksLoadedWatcherWithoutPID(t *testing.T) {
 	argvLog := filepath.Join(dir, "argv.log")
 	t.Setenv("CAP_LAUNCHCTL", fakeLaunchctl(t, state, argvLog))
 	t.Setenv("CAP_TRACE", filepath.Join(dir, "trace.log"))
+	isolated(t)
+	claimFor(t, "test")
 
 	var out, errOut bytes.Buffer
 	if code := run([]string{"start"}, &out, &errOut); code != 0 {
@@ -177,6 +211,8 @@ func TestStopBootsOut(t *testing.T) {
 	argvLog := filepath.Join(dir, "argv.log")
 	t.Setenv("CAP_LAUNCHCTL", fakeLaunchctl(t, state, argvLog))
 	t.Setenv("CAP_TRACE", filepath.Join(dir, "trace.log"))
+	isolated(t)
+	claimFor(t, "test")
 
 	var out, errOut bytes.Buffer
 	if code := run([]string{"stop", "--json"}, &out, &errOut); code != 0 {
@@ -191,15 +227,17 @@ func TestStopBootsOut(t *testing.T) {
 	}
 }
 
-// AC12: every interface verb leaves the board and the store untouched. The
-// fake fs logs argv; the memstore file must never be created.
-func TestInterfaceTouchesNoBoardOrStore(t *testing.T) {
+// AC12: the interface never calls fs and never writes knowledge. With the cap
+// claim (AC19) status, start and stop read and write one `cap.claim` row and
+// nothing else; logs touches no store at all.
+func TestInterfaceCallsNoBoardAndWritesNoKnowledge(t *testing.T) {
 	dir := t.TempDir()
 	argvLog := filepath.Join(dir, "fs-argv.log")
 	fsBin := writeExec(t, "fs", fmt.Sprintf(`echo "$@" >> %q; exit 0`, argvLog))
 	t.Setenv("CAP_FS_BIN", fsBin)
-	store := filepath.Join(dir, "memory.db")
-	t.Setenv("MEMSTORE_DB", store)
+	storePath := filepath.Join(dir, "memory.db")
+	t.Setenv("MEMSTORE_DB", storePath)
+	t.Setenv("CAP_SESSION", "test")
 	t.Setenv("CAP_TRACE", filepath.Join(dir, "trace.log"))
 	t.Setenv("CAP_LAUNCHCTL", fakeLaunchctl(t, filepath.Join(dir, "state"), filepath.Join(dir, "lc.log")))
 	plist := filepath.Join(dir, "cap.plist")
@@ -207,6 +245,7 @@ func TestInterfaceTouchesNoBoardOrStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("CAP_SERVICE_PLIST", plist)
+	claimFor(t, "test")
 
 	for _, args := range [][]string{
 		{"status"}, {"start"}, {"stop"}, {"logs", "--tail", "3"},
@@ -219,8 +258,35 @@ func TestInterfaceTouchesNoBoardOrStore(t *testing.T) {
 	if _, err := os.Stat(argvLog); !os.IsNotExist(err) {
 		t.Fatalf("fs was called by the interface: %v", argvLogLines(t, argvLog))
 	}
-	if _, err := os.Stat(store); !os.IsNotExist(err) {
-		t.Fatalf("the interface opened the store: %v", err)
+	m, err := state.Open(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := m.Recent(state.CursorScope, 1000)
+	m.CloseDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.Kind != state.KindClaim {
+			t.Fatalf("the interface wrote a %s row: %q", r.Kind, r.Text)
+		}
+	}
+}
+
+// AC12: logs reads the trace and nothing else; it must not open the store.
+func TestLogsTouchesNoStore(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "memory.db")
+	t.Setenv("MEMSTORE_DB", storePath)
+	t.Setenv("CAP_TRACE", filepath.Join(dir, "trace.log"))
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"logs", "--tail", "2"}, &out, &errOut); code != 0 {
+		t.Fatalf("logs exit = %d, stderr %s", code, errOut.String())
+	}
+	if _, err := os.Stat(storePath); !os.IsNotExist(err) {
+		t.Fatalf("logs opened the store: %v", err)
 	}
 }
 
@@ -277,6 +343,7 @@ func TestActJSON(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "memory.db")
 	t.Setenv("MEMSTORE_DB", dbPath)
+	t.Setenv("CAP_SESSION", "test")
 	t.Setenv("CAP_TRACE", filepath.Join(dir, "trace.log"))
 	t.Setenv("CAP_FS_BIN", writeExec(t, "fs", `cat <<'JSON'
 {"ok":true,"data":{"projects":[{"project":"p","tasks":[{"task":"t-1","kind":"dev","state":"open","goal":"g","checks":["c"],"project_path":"/tmp"}]}]}}
@@ -291,6 +358,7 @@ JSON`))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	claimFor(t, "test")
 
 	var out, errOut bytes.Buffer
 	if code := run([]string{"act", "--json", "t-1"}, &out, &errOut); code != 0 {

@@ -51,16 +51,25 @@ type actJSON struct {
 }
 
 type statusJSON struct {
-	Running            bool     `json:"running"`
-	Loaded             bool     `json:"loaded"`
-	PID                int      `json:"pid,omitempty"`
-	Stale              bool     `json:"stale"`
-	Label              string   `json:"label"`
-	Plist              string   `json:"plist,omitempty"`
-	LastTickAt         string   `json:"last_tick_at,omitempty"`
-	LastTickAgeSeconds *float64 `json:"last_tick_age_seconds,omitempty"`
-	LastError          string   `json:"last_error,omitempty"`
-	Trace              string   `json:"trace"`
+	Running            bool      `json:"running"`
+	Loaded             bool      `json:"loaded"`
+	PID                int       `json:"pid,omitempty"`
+	Stale              bool      `json:"stale"`
+	Label              string    `json:"label"`
+	Plist              string    `json:"plist,omitempty"`
+	LastTickAt         string    `json:"last_tick_at,omitempty"`
+	LastTickAgeSeconds *float64  `json:"last_tick_age_seconds,omitempty"`
+	LastError          string    `json:"last_error,omitempty"`
+	Trace              string    `json:"trace"`
+	Claim              claimJSON `json:"claim"`
+}
+
+// claimJSON names the session that holds cap's write verbs. Held is false when
+// the claim is stale or absent; Session then names the last holder.
+type claimJSON struct {
+	Session string `json:"session,omitempty"`
+	Expires string `json:"expires,omitempty"`
+	Held    bool   `json:"held"`
 }
 
 type actionJSON struct {
@@ -114,7 +123,7 @@ func newReport(r watcher.Report) reportJSON {
 
 // newStatus reads the newest tick event. last_error is only current if the
 // newest tick failed; an old error behind a newer good tick is history.
-func newStatus(svc service.Launchd, st service.State, events []map[string]any, now time.Time) statusJSON {
+func newStatus(svc service.Launchd, st service.State, events []map[string]any, now time.Time, claim *state.Claim) statusJSON {
 	s := statusJSON{
 		Running: st.Loaded && st.PID > 0,
 		Loaded:  st.Loaded,
@@ -122,6 +131,7 @@ func newStatus(svc service.Launchd, st service.State, events []map[string]any, n
 		Label:   svc.Label,
 		Plist:   svc.Plist,
 		Trace:   tracePath(),
+		Claim:   newClaim(claim, now),
 	}
 	var last map[string]any
 	for _, e := range events {
@@ -143,6 +153,18 @@ func newStatus(svc service.Launchd, st service.State, events []map[string]any, n
 		s.LastError = fmt.Sprint(last["error"])
 	}
 	return s
+}
+
+// newClaim names the holder, or the last holder when the claim is stale.
+func newClaim(c *state.Claim, now time.Time) claimJSON {
+	if c == nil {
+		return claimJSON{}
+	}
+	return claimJSON{
+		Session: c.Session,
+		Expires: c.Expires.UTC().Format(time.RFC3339),
+		Held:    c.Live(now),
+	}
 }
 
 func newAction(action string, svc service.Launchd, st service.State) actionJSON {
@@ -176,6 +198,14 @@ func (s statusJSON) Text() string {
 	}
 	if s.LastError != "" {
 		fmt.Fprintf(&b, "last error: %s\n", s.LastError)
+	}
+	switch {
+	case s.Claim.Session == "":
+		b.WriteString("cap claim: none\n")
+	case s.Claim.Held:
+		fmt.Fprintf(&b, "cap claim: held by %s until %s\n", s.Claim.Session, s.Claim.Expires)
+	default:
+		fmt.Fprintf(&b, "cap claim: stale, last held by %s until %s\n", s.Claim.Session, s.Claim.Expires)
 	}
 	return b.String()
 }
