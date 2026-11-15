@@ -136,6 +136,10 @@ type engine struct {
 	taken   []state.Action
 	refused []string
 	err     error
+	// orphanAsked is this tick's own answer to hasQuestion for the one
+	// board-wide gap: rows were read at tick start and cannot see a question
+	// written moments earlier in the same tick.
+	orphanAsked bool
 }
 
 // reapClosed calls fs reap once per project whose round just closed while the
@@ -224,11 +228,12 @@ func (e *engine) blocked(t board.Task, p agents.Pane) {
 
 func (e *engine) blockedOrphan(p agents.Pane) {
 	missing := "blocked: agent is waiting on a prompt"
-	if !e.hasQuestion("", missing) {
+	if !e.orphanAsked && !e.hasQuestion("", missing) {
 		if err := e.ask("", "", state.CursorScope, missing); err != nil {
 			e.err = err
 			return
 		}
+		e.orphanAsked = true
 	}
 	body := fmt.Sprintf("unowned agent blocked in %s (pane %s)", p.CWD, p.ID)
 	if err := e.w.Agents.Notify(e.ctx, "cap: agent blocked", body); err != nil {

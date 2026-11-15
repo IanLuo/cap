@@ -392,20 +392,22 @@ func TestAC18BlockedIsRecordedAndAnnounced(t *testing.T) {
 		b := &fakeBoard{}
 		s, _ := newStorePath(t)
 		c := newClock("2026-11-15T10:00:00Z")
-		h := &fakeHarness{panes: []agents.Pane{pane("p2", "claude", "idle")}}
+		h := &fakeHarness{panes: []agents.Pane{pane("p2", "claude", "idle"), pane("p3", "pi", "idle")}}
 		w := tierWatcher(b, s, h, &fakeReaper{}, c)
 
 		if _, err := w.Tick(context.Background()); err != nil {
 			t.Fatalf("first tick: %v", err)
 		}
-		h.panes = []agents.Pane{pane("p2", "claude", "blocked")}
+		// Both unowned panes block in the same tick: one board-wide gap, two
+		// announcements.
+		h.panes = []agents.Pane{pane("p2", "claude", "blocked"), pane("p3", "pi", "blocked")}
 		tick(t, w, c, 30*time.Second)
 
 		if qs := questionsIn(t, s, state.CursorScope); len(qs) != 1 {
 			t.Fatalf("questions = %+v, want one board-wide question", qs)
 		}
-		if len(h.notified) != 1 {
-			t.Fatalf("notifications = %d, want one", len(h.notified))
+		if len(h.notified) != 2 {
+			t.Fatalf("notifications = %d, want one per blocked pane", len(h.notified))
 		}
 		if len(h.closed) != 0 || len(h.prompts) != 0 {
 			t.Fatalf("cap closed %v or prompted %v; an unowned blocked pane is only announced", h.closed, h.prompts)
