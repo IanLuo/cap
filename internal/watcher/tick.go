@@ -92,7 +92,10 @@ func (w *Watcher) Tick(ctx context.Context) (Report, error) {
 			harnessOK = true
 		}
 	}
-	if old != nil && harnessOK {
+	// Tier 1 needs a previous pane snapshot to compare with. A cursor from a
+	// build that kept none is a baseline, not a transition.
+	baseline := old == nil || (len(old.Panes) == 0 && len(panes) > 0)
+	if harnessOK && !baseline {
 		actions, refused, err := w.tier1(ctx, old, tasks, panes, rows, report.Changes)
 		if err != nil {
 			return report, err
