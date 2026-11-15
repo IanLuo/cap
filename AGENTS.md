@@ -43,7 +43,7 @@ nix build .
 - **One action per task and class per 90 s, recorded before the side effect.** The gate and the refusal name the earlier action, exactly as `cap act` does. A failed action is recorded and reported, never retried inside the gate.
 - **An fs-launched pane is reaped by fs, never closed by cap.** A pane that never held an agent is a human terminal: never closed. A pane that held an agent and lost it, with no launch row, is closed only after the 300 s grace. A pane that still holds an agent and has no launch row is human-owned: cap announces a blocked one and never closes it.
 - **A blocked agent is never answered.** A transition into `blocked` writes one question and posts one notification; cap sends no prompt and no keys.
-- **Nudge is bounded.** At most two prompts per task per fs round, and only to an idle agent on a claimed task whose lease has lapsed. A working agent is never prompted.
+- **Nudge is bounded.** At most two prompts per task per fs round, and only to an idle agent on a claimed task whose lease has lapsed. A working agent is never prompted. A task cap nudged or announced in a tick is not reaped in that tick: fs closes an idle agent whose lease lapsed, so the reap would undo the prompt before the agent could renew.
 - **State rows are immutable.** An update is close the old row and write a new one; history stays closed and inert. Never rewrite a record in place.
 - **The 90 s gate uses the newest act's `launched_at`, including closed acts.** Inside the gate: not recommended, not launched, and the refusal names the earlier launch.
 - **The act is recorded before the command starts; a failed start closes it.** A crash between the two leaves an open act that still holds the gate, never a launch nothing knows about.

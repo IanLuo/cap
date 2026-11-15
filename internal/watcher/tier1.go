@@ -46,7 +46,7 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 	if err != nil {
 		return nil, nil, err
 	}
-	e := &engine{w: w, ctx: ctx, now: w.now(), old: old, tasks: tasks, panes: panes, rows: rows, actions: actions}
+	e := &engine{w: w, ctx: ctx, now: w.now(), old: old, tasks: tasks, panes: panes, rows: rows, actions: actions, spoken: map[string]bool{}}
 
 	paneByID := make(map[string]agents.Pane, len(panes))
 	for _, p := range panes {
@@ -148,6 +148,10 @@ type engine struct {
 	// board-wide gap: rows were read at tick start and cannot see a question
 	// written moments earlier in the same tick.
 	orphanAsked bool
+	// spoken holds every task cap nudged or announced this tick. The reap
+	// skips their panes: fs closes an idle agent on a lapsed lease, and cap
+	// does not close a pane it just asked the human or the agent to answer.
+	spoken map[string]bool
 }
 
 // reapClosed calls fs reap once per project whose round just ended while the
@@ -202,7 +206,7 @@ func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
 			continue
 		}
 		switch {
-		case o.LeaseLive && !t.LeaseLive:
+		case o.LeaseLive && !t.LeaseLive && !e.spoken[t.Task]:
 			add(roundEnd{t.Project, t.Task, t.Process.Pane, "lease lapsed on task " + t.Task + ", pane " + t.Process.Pane + " still open"})
 		case reviewVerdictEnded(o, t):
 			add(roundEnd{t.Project, t.Task, t.Process.Pane, "review verdict " + t.Agent.Reported + " on task " + t.Task + ", pane " + t.Process.Pane + " still open"})
@@ -249,6 +253,9 @@ func (e *engine) nudge(t board.Task, p agents.Pane) {
 		return
 	}
 	text := nudgeText(t)
+	// A pane cap just spoke to is not reaped in the same tick: fs closes an
+	// idle agent whose lease lapsed, and the prod must get its chance to renew.
+	e.spoken[target] = true
 	e.perform(state.Action{
 		Class:   ClassNudge,
 		Target:  target,
@@ -270,6 +277,9 @@ func nudgeText(t board.Task) string {
 }
 
 func (e *engine) blocked(t board.Task, p agents.Pane) {
+	// Announcing a blocked agent must not be undone in the same tick: the
+	// human answers, and the pane waits for that answer.
+	e.spoken[t.Task] = true
 	missing := "blocked: agent is waiting on a prompt"
 	if !e.hasQuestion(t.Task, missing) {
 		if err := e.ask(t.Task, t.Project, state.Scope(t.Project), missing); err != nil {

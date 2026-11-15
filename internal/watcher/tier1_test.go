@@ -103,6 +103,22 @@ func actionsIn(t *testing.T, s state.Store, scope string) []state.Action {
 	return as
 }
 
+// seedNudge writes a finished nudge for the task's round, as an earlier tick
+// would have left it.
+func seedNudge(t *testing.T, s state.Store, task string, round int, at time.Time) {
+	t.Helper()
+	text, err := state.Encode(state.Action{
+		Class: ClassNudge, Target: task, Project: "cap", Task: task, Round: round,
+		Trigger: "seeded", At: at, Outcome: state.ActionDone,
+	})
+	if err != nil {
+		t.Fatalf("encode nudge: %v", err)
+	}
+	if _, err := s.Put(state.KindAction, state.Scope("cap"), "nudge "+task, text); err != nil {
+		t.Fatalf("seed nudge: %v", err)
+	}
+}
+
 func questionsIn(t *testing.T, s state.Store, scope string) []state.Question {
 	t.Helper()
 	rows, err := s.Recent(scope, 1000)
@@ -200,10 +216,11 @@ func TestAC14ReapsOnTheBaselineTick(t *testing.T) {
 	}
 }
 
-// AC14, round ended without the task closing: a lapsed lease or a fresh review
-// verdict still reaps the project while the pane is open.
+// AC14, round ended without the task closing: a lapsed lease reaps once the
+// round's nudges are spent, and a fresh review verdict reaps at once. A pane
+// cap just spoke to is not reaped in that tick.
 func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
-	t.Run("lease lapsed", func(t *testing.T) {
+	t.Run("lease lapsed, nudges spent", func(t *testing.T) {
 		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
 		s, _ := newStorePath(t)
 		c := newClock("2026-11-15T10:00:00Z")
@@ -211,12 +228,18 @@ func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
 		rp := &fakeReaper{}
 		w := tierWatcher(b, s, h, rp, c)
 
+		for i := 0; i < maxNudgesPerRound; i++ {
+			seedNudge(t, s, "t-1", 1, c.at.Add(-time.Hour))
+		}
 		if _, err := w.Tick(context.Background()); err != nil {
 			t.Fatalf("first tick: %v", err)
 		}
 		b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)}
 		report := tick(t, w, c, 30*time.Second)
 
+		if len(h.prompts) != 0 {
+			t.Fatalf("prompts = %d; the round's nudges are spent", len(h.prompts))
+		}
 		if len(rp.calls) != 1 || rp.calls[0] != "cap" {
 			t.Fatalf("reap calls = %v, want exactly [cap]", rp.calls)
 		}
@@ -239,6 +262,28 @@ func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
 		}
 		if len(quiet.Actions) != 0 {
 			t.Fatalf("actions = %+v on an unchanged tick", quiet.Actions)
+		}
+	})
+
+	t.Run("lease lapsed, a nudge is due", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+
+		if _, err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("first tick: %v", err)
+		}
+		b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)}
+		tick(t, w, c, 30*time.Second)
+
+		if len(h.prompts) != 1 {
+			t.Fatalf("prompts = %d, want the nudge", len(h.prompts))
+		}
+		if len(rp.calls) != 0 {
+			t.Fatalf("reap calls = %v; the pane cap just nudged is not reaped in the same tick", rp.calls)
 		}
 	})
 
