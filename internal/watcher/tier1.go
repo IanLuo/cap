@@ -39,7 +39,13 @@ func (w *Watcher) closeGrace() time.Duration {
 // takes at most one action per task and class inside the gate. It never
 // dispatches, never closes an fs-launched pane, and never answers a blocked
 // agent. A side effect that fails is recorded and reported, not retried.
-func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Task, panes []agents.Pane, rows []state.Row, changes []Change) ([]state.Action, []string, error) {
+// tier1 reads the transitions between the previous cursor and this tick and
+// takes at most one action per task and class inside the gate. It never
+// dispatches, never closes an fs-launched pane, and never answers a blocked
+// agent. A side effect that fails is recorded and reported, not retried.
+// paneBaseline says the previous cursor holds no pane snapshot, so no pane can
+// have moved; the reap keys off the board change instead, and still runs.
+func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Task, panes []agents.Pane, rows []state.Row, changes []Change, paneBaseline bool) ([]state.Action, []string, error) {
 	actions, err := state.Actions(rows)
 	if err != nil {
 		return nil, nil, err
@@ -61,11 +67,14 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 		oldPanes[p.Pane] = p
 	}
 
-	ids := make([]string, 0, len(panes))
-	for id := range paneByID {
-		ids = append(ids, id)
+	var ids []string
+	if !paneBaseline {
+		ids = make([]string, 0, len(panes))
+		for id := range paneByID {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
 	}
-	sort.Strings(ids)
 	for _, id := range ids {
 		p := paneByID[id]
 		prev, seen := oldPanes[id]

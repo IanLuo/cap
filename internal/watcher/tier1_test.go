@@ -168,6 +168,35 @@ func TestAC14TierOneActsOnlyOnTransitions(t *testing.T) {
 	}
 }
 
+// AC14, upgrade case: a cursor written before cap kept pane snapshots still
+// reaps a round that closes on the first tick with panes; only the pane
+// transitions wait for a baseline.
+func TestAC14ReapsOnTheBaselineTick(t *testing.T) {
+	b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{} // the harness listed no panes: the cursor keeps none
+	rp := &fakeReaper{}
+	w := tierWatcher(b, s, h, rp, c)
+
+	if _, err := w.Tick(context.Background()); err != nil {
+		t.Fatalf("first tick: %v", err)
+	}
+
+	h.panes = []agents.Pane{pane("p1", "claude", "idle")}
+	b.tasks = nil // the round closed; fs's pane is still open
+	report := tick(t, w, c, 30*time.Second)
+	if len(rp.calls) != 1 || rp.calls[0] != "cap" {
+		t.Fatalf("reap calls = %v, want exactly [cap] on the baseline tick", rp.calls)
+	}
+	if len(h.prompts) != 0 || len(h.closed) != 0 {
+		t.Fatalf("baseline tick prompted %v or closed %v; only the reap runs", h.prompts, h.closed)
+	}
+	if len(report.Actions) != 1 || report.Actions[0].Class != ClassReap {
+		t.Fatalf("actions = %+v, want one reap", report.Actions)
+	}
+}
+
 // AC15: a second transition inside the gate runs nothing, and the refusal names
 // the earlier action.
 func TestAC15OneActionPerClassInGate(t *testing.T) {
