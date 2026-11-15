@@ -112,8 +112,11 @@ func (w *Watcher) Tick(ctx context.Context) (Report, error) {
 	panesChanged := harnessOK && (old == nil || !samePanes(old.Panes, nextPanes))
 
 	// The cursor is last: a failed knowledge read must leave the board looking
-	// changed, so the next tick retries the recommendation.
-	if report.Changed || panesChanged {
+	// changed, so the next tick retries the recommendation. A failed harness
+	// read stays unwritten for the same reason: the transition it would have
+	// acted on is replayed on the next readable tick, not consumed here.
+	harnessFailed := w.Agents != nil && !harnessOK
+	if (report.Changed || panesChanged) && !harnessFailed {
 		if err := w.writeCursor(cursorRows, next, nextPanes, now); err != nil {
 			return report, err
 		}

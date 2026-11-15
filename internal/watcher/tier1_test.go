@@ -577,4 +577,12 @@ func TestN5UnreadableHarnessSkipsTierOne(t *testing.T) {
 	if !found {
 		t.Fatal("unreadable harness left no trace event")
 	}
+
+	// The transition the failed tick could not act on is not consumed: the
+	// next readable tick replays it and reaps.
+	h.listErr = nil
+	tick(t, w, c, 30*time.Second)
+	if len(rp.calls) != 1 || rp.calls[0] != "cap" {
+		t.Fatalf("reap calls = %v, want exactly [cap] once the harness recovered", rp.calls)
+	}
 }
