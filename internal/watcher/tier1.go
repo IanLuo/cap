@@ -50,15 +50,14 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 	if err != nil {
 		return nil, nil, err
 	}
-	e := &engine{w: w, ctx: ctx, now: w.now(), old: old, tasks: tasks, panes: panes, rows: rows, actions: actions, spoken: map[string]bool{}}
+	e := &engine{w: w, ctx: ctx, now: w.now(), old: old, tasks: tasks, panes: panes, rows: rows, actions: actions, spoken: map[string]bool{}, reaped: map[string]bool{}}
 
 	paneByID := make(map[string]agents.Pane, len(panes))
 	for _, p := range panes {
 		paneByID[p.ID] = p
 	}
-	var baselineReaped map[string]bool
 	if old == nil || paneBaseline {
-		baselineReaped = e.reapBaseline(paneByID)
+		e.reapBaseline(paneByID)
 	}
 	if old == nil {
 		return e.taken, e.refused, e.err
@@ -113,6 +112,12 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 			}
 			continue
 		}
+		// fs keeps a working agent at its round's close. When that pane stops
+		// working, the harness transition is the trigger to ask fs again: fs
+		// closes an idle agent whose round is over. cap never closes the pane.
+		if !e.spoken[t.Task] && transition && prev.Status == "working" && p.Status != "working" && roundOver(t) {
+			e.reapOnce(t.Project, "pane "+p.ID+" stopped working, round over on task "+t.Task)
+		}
 		switch p.Status {
 		case "blocked":
 			if transition {
@@ -137,7 +142,8 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 		}
 	}
 
-	e.reapClosed(changes, paneByID, baselineReaped)
+	e.announceClosed(changes)
+	e.reapClosed(changes, paneByID)
 	if e.err != nil {
 		return e.taken, e.refused, e.err
 	}
@@ -164,59 +170,84 @@ type engine struct {
 	// skips their panes: fs closes an idle agent on a lapsed lease, and cap
 	// does not close a pane it just asked the human or the agent to answer.
 	spoken map[string]bool
+	// reaped holds every project this tick already asked fs to reap. Several
+	// transitions can end one project's round; fs is asked once.
+	reaped map[string]bool
+}
+
+// reapOnce is the one reap cap takes for a project in a tick, whichever
+// transition led to it. The 90 s gate still holds across ticks.
+func (e *engine) reapOnce(project, why string) {
+	if e.w.Reap == nil || e.reaped[project] {
+		return
+	}
+	e.reaped[project] = true
+	e.perform(state.Action{
+		Class:   ClassReap,
+		Target:  project,
+		Project: project,
+		Trigger: why,
+	}, func() error { return e.w.Reap.Reap(e.ctx, project) })
 }
 
 // reapBaseline is the first observation's one act: one fs reap for every
 // project that still has an fs launch row whose pane is open in the harness.
 // The cursor cannot witness a round that ended while cap was not running, so
-// the open pane is the evidence. It returns the projects it handled, so the
-// transition reap does not try the same project twice in one tick.
-func (e *engine) reapBaseline(paneByID map[string]agents.Pane) map[string]bool {
-	reaped := map[string]bool{}
-	if e.w.Reap == nil {
-		return reaped
-	}
+// the open pane is the evidence.
+func (e *engine) reapBaseline(paneByID map[string]agents.Pane) {
 	for _, t := range e.tasks {
-		if t.Process.Pane == "" || reaped[t.Project] {
+		if t.Process.Pane == "" {
 			continue
 		}
 		if _, open := paneByID[t.Process.Pane]; !open {
 			continue
 		}
-		reaped[t.Project] = true
-		project := t.Project
-		e.perform(state.Action{
-			Class:   ClassReap,
-			Target:  project,
-			Project: project,
-			Trigger: "first read: task " + t.Task + ", pane " + t.Process.Pane + " still open",
-		}, func() error { return e.w.Reap.Reap(e.ctx, project) })
+		e.reapOnce(t.Project, "first read: task "+t.Task+", pane "+t.Process.Pane+" still open")
 	}
-	return reaped
+}
+
+// roundOver reports whether the board says the task's round has ended: the task
+// is closed, or its session's newest review word is fail or blocked.
+func roundOver(t board.Task) bool {
+	if t.State == "done" {
+		return true
+	}
+	return t.Agent.Role == "review" && (t.Agent.Reported == "fail" || t.Agent.Reported == "blocked")
+}
+
+// announceClosed posts one notification for a dev task that just left the
+// board: fs completes a dev task only through a review that ran its declared
+// checks, so the round is done and the review passed. The review task that
+// closed the same round is not announced again.
+func (e *engine) announceClosed(changes []Change) {
+	oldByTask := map[string]state.CursorTask{}
+	for _, t := range e.old.Tasks {
+		oldByTask[t.Task] = t
+	}
+	for _, c := range changes {
+		if !strings.HasPrefix(c.Reason, "no longer open") {
+			continue
+		}
+		if o, ok := oldByTask[c.Task]; !ok || o.Kind != "dev" {
+			continue
+		}
+		if err := e.w.Agents.Notify(e.ctx, "cap: round closed", c.Project+" "+c.Task+" done, review passed"); err != nil {
+			e.refused = append(e.refused, "notify "+c.Task+": "+err.Error())
+		}
+	}
 }
 
 // reapClosed calls fs reap once per project whose round just ended while the
 // pane fs launched is still open. fs decides which pane to close; cap notices
 // the transition that ended the round: the task left the board, its lease
 // lapsed, or its session's newest review word became fail or blocked.
-func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane, baselineReaped map[string]bool) {
+func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
 	if e.w.Reap == nil || e.old == nil {
 		return
 	}
 	oldByTask := map[string]state.CursorTask{}
 	for _, t := range e.old.Tasks {
 		oldByTask[t.Task] = t
-	}
-
-	type roundEnd struct{ project, task, pane, why string }
-	var ended []roundEnd
-	reaped := map[string]bool{}
-	add := func(r roundEnd) {
-		if reaped[r.project] || baselineReaped[r.project] {
-			return
-		}
-		reaped[r.project] = true
-		ended = append(ended, r)
 	}
 
 	// A task that left the board carries its pane from the previous cursor.
@@ -231,12 +262,12 @@ func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane, b
 		if _, open := paneByID[o.Pane]; !open {
 			continue
 		}
-		add(roundEnd{c.Project, c.Task, o.Pane, "round closed for task " + c.Task + ", pane " + o.Pane + " still open"})
+		e.reapOnce(c.Project, "round closed for task "+c.Task+", pane "+o.Pane+" still open")
 	}
 
 	// A task still on the board whose round ended without the task closing.
 	for _, t := range e.tasks {
-		if t.Process.Pane == "" || reaped[t.Project] {
+		if t.Process.Pane == "" {
 			continue
 		}
 		if _, open := paneByID[t.Process.Pane]; !open {
@@ -248,20 +279,10 @@ func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane, b
 		}
 		switch {
 		case o.LeaseLive && !t.LeaseLive && !e.spoken[t.Task]:
-			add(roundEnd{t.Project, t.Task, t.Process.Pane, "lease lapsed on task " + t.Task + ", pane " + t.Process.Pane + " still open"})
+			e.reapOnce(t.Project, "lease lapsed on task "+t.Task+", pane "+t.Process.Pane+" still open")
 		case reviewVerdictEnded(o, t):
-			add(roundEnd{t.Project, t.Task, t.Process.Pane, "review verdict " + t.Agent.Reported + " on task " + t.Task + ", pane " + t.Process.Pane + " still open"})
+			e.reapOnce(t.Project, "review verdict "+t.Agent.Reported+" on task "+t.Task+", pane "+t.Process.Pane+" still open")
 		}
-	}
-
-	for _, r := range ended {
-		project := r.project
-		e.perform(state.Action{
-			Class:   ClassReap,
-			Target:  project,
-			Project: project,
-			Trigger: r.why,
-		}, func() error { return e.w.Reap.Reap(e.ctx, project) })
 	}
 }
 

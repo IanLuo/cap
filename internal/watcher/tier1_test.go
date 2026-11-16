@@ -838,3 +838,146 @@ func TestAC20TierOneDecisionsAreTraced(t *testing.T) {
 		}
 	})
 }
+
+// AC14, the harness transition: fs keeps a working agent at its round's close.
+// When the pane stops working, the tick asks fs again; cap still never closes
+// the pane. A round still open is not reaped on that transition.
+func TestAC14ReapsWhenTheAgentStopsWorking(t *testing.T) {
+	t.Run("a closed round", func(t *testing.T) {
+		done := claimedTask("t-1", "cap", "p1", 1, false)
+		done.State = "done"
+		b := &fakeBoard{tasks: []board.Task{done}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+
+		h.panes = []agents.Pane{pane("p1", "claude", "idle")}
+		report := tick(t, w, c, 30*time.Second)
+
+		if len(rp.calls) != 1 || rp.calls[0] != "cap" {
+			t.Fatalf("reap calls = %v, want exactly [cap] when the pane stops working", rp.calls)
+		}
+		if len(h.closed) != 0 {
+			t.Fatalf("cap closed %v; an fs pane is reaped by fs, never closed by cap", h.closed)
+		}
+		reaped := false
+		for _, a := range report.Actions {
+			if a.Class == ClassReap && a.Outcome == state.ActionDone {
+				reaped = true
+			}
+		}
+		if !reaped {
+			t.Fatalf("actions = %+v, want one done reap", report.Actions)
+		}
+
+		quiet := tick(t, w, c, 30*time.Second)
+		if len(rp.calls) != 1 {
+			t.Fatalf("reap calls = %v; the transition reaped once", rp.calls)
+		}
+		if len(quiet.Actions) != 0 {
+			t.Fatalf("actions = %+v on an unchanged tick", quiet.Actions)
+		}
+	})
+
+	t.Run("a failed review", func(t *testing.T) {
+		at, _ := time.Parse(time.RFC3339, "2026-11-15T10:00:00Z")
+		failed := claimedTask("t-2", "cap", "p2", 1, true)
+		failed.Kind = "review"
+		failed.Agent = board.Observed{Role: "review", State: "fail", Reported: "fail", At: &at}
+		b := &fakeBoard{tasks: []board.Task{failed}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p2", "claude", "working")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+
+		h.panes = []agents.Pane{pane("p2", "claude", "idle")}
+		tick(t, w, c, 30*time.Second)
+
+		if len(rp.calls) != 1 || rp.calls[0] != "cap" {
+			t.Fatalf("reap calls = %v, want exactly [cap] after a failed review's agent stops", rp.calls)
+		}
+	})
+
+	t.Run("the round is still open", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+
+		h.panes = []agents.Pane{pane("p1", "claude", "idle")}
+		tick(t, w, c, 30*time.Second)
+
+		if len(rp.calls) != 0 {
+			t.Fatalf("reap calls = %v; the task's round is still open", rp.calls)
+		}
+	})
+}
+
+// AC21: a dev task leaving the board is announced as a closed round; the
+// review task that closed the same round is not announced twice.
+func TestAC21AClosedRoundIsAnnounced(t *testing.T) {
+	t.Run("a dev task", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+
+		b.tasks = nil
+		tick(t, w, c, 30*time.Second)
+		if len(h.notified) != 1 {
+			t.Fatalf("notifications = %v, want one round-close line", h.notified)
+		}
+		if !strings.Contains(h.notified[0], "cap: round closed") || !strings.Contains(h.notified[0], "cap t-1 done, review passed") {
+			t.Fatalf("notification = %q, want the round-close line naming the project and task", h.notified[0])
+		}
+
+		tick(t, w, c, 30*time.Second)
+		if len(h.notified) != 1 {
+			t.Fatalf("notifications = %v; a closed round is announced once", h.notified)
+		}
+	})
+
+	t.Run("a review task", func(t *testing.T) {
+		rev := claimedTask("t-2", "cap", "p2", 1, true)
+		rev.Kind = "review"
+		b := &fakeBoard{tasks: []board.Task{rev}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p2", "claude", "working")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+
+		b.tasks = nil
+		tick(t, w, c, 30*time.Second)
+
+		if len(h.notified) != 0 {
+			t.Fatalf("notifications = %v; a review closes the round its dev task announces", h.notified)
+		}
+	})
+
+	t.Run("no closed round", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+
+		tick(t, w, c, 30*time.Second)
+		tick(t, w, c, 30*time.Second)
+
+		if len(h.notified) != 0 {
+			t.Fatalf("notifications = %v on an unchanged board", h.notified)
+		}
+	})
+}
