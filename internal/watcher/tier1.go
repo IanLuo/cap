@@ -19,6 +19,9 @@ const (
 	ClassClose   = "close"
 	ClassNudge   = "nudge"
 	ClassBlocked = "blocked"
+	// ClassInform reports a tick's actions to the live claim holder. It is
+	// news, never an instruction: it answers nothing and starts nothing.
+	ClassInform = "inform"
 
 	// DefaultCloseGrace is how long an empty pane with no launch row must be
 	// seen before cap closes it. A transition starts the timer; the grace only
@@ -39,7 +42,8 @@ func (w *Watcher) closeGrace() time.Duration {
 // tier1 reads the transitions between the previous cursor and this tick and
 // takes at most one action per task and class inside the gate. It never
 // dispatches, never closes an fs-launched pane, and never answers a blocked
-// agent. A side effect that fails is recorded and reported, not retried.
+// agent. It then tells the live claim holder what it did, in one prompt.
+// A side effect that fails is recorded and reported, not retried.
 // paneBaseline says the previous cursor holds no pane snapshot, so no pane can
 // have moved; the reap keys off the board change instead, and still runs.
 // Without a previous cursor at all there is nothing to compare: the tick is the
@@ -60,6 +64,7 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 		e.reapBaseline(paneByID)
 	}
 	if old == nil {
+		e.inform(paneByID)
 		return e.taken, e.refused, e.err
 	}
 
@@ -144,6 +149,7 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 
 	e.announceClosed(changes)
 	e.reapClosed(changes, paneByID)
+	e.inform(paneByID)
 	if e.err != nil {
 		return e.taken, e.refused, e.err
 	}
@@ -235,6 +241,72 @@ func (e *engine) announceClosed(changes []Change) {
 			e.refused = append(e.refused, "notify "+c.Task+": "+err.Error())
 		}
 	}
+}
+
+// inform tells the live claim holder what this tick did: one prompt, one line
+// per action, each naming its class, project, task by goal and outcome. It is
+// the one message on the clock path addressed to a session. It reports; it
+// never instructs, never answers a blocked agent (so it never prompts a pane
+// the harness shows as blocked), and never changes what an action does.
+func (e *engine) inform(paneByID map[string]agents.Pane) {
+	if len(e.taken) == 0 {
+		return
+	}
+	claim, err := state.OpenClaim(e.rows)
+	if err != nil {
+		e.err = err
+		return
+	}
+	if claim == nil || claim.Pane == "" || !claim.Live(e.now) {
+		return
+	}
+	p, listed := paneByID[claim.Pane]
+	if !listed || p.Agent == "" || p.Status == "blocked" {
+		return
+	}
+	a := state.Action{
+		Class:   ClassInform,
+		Target:  claim.Session,
+		Pane:    claim.Pane,
+		Trigger: fmt.Sprintf("%d actions this tick", len(e.taken)),
+	}
+	text := e.informText()
+	e.performUngated(a, func() error { return e.w.Agents.Prompt(e.ctx, claim.Pane, text) })
+}
+
+// informText renders the tick's actions for the claim holder. Tasks are named
+// by goal, never by id: the reader of this line is deciding what to do next.
+func (e *engine) informText() string {
+	goals := make(map[string]string, len(e.tasks))
+	if e.old != nil {
+		goals = make(map[string]string, len(e.tasks)+len(e.old.Tasks))
+		for _, t := range e.old.Tasks {
+			goals[t.Task] = t.Goal
+		}
+	}
+	for _, t := range e.tasks {
+		goals[t.Task] = t.Goal
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "cap: %d action(s) this tick. Report only; nothing here asks a question.\n", len(e.taken))
+	for _, a := range e.taken {
+		project := a.Project
+		if project == "" {
+			project = "cap"
+		}
+		subject := a.Trigger
+		for id, goal := range goals {
+			if goal == "" {
+				continue
+			}
+			subject = strings.ReplaceAll(subject, id, `"`+goal+`"`)
+		}
+		if a.Task != "" && goals[a.Task] != "" {
+			subject = `"` + goals[a.Task] + `"`
+		}
+		fmt.Fprintf(&b, "- %s %s: %s -> %s\n", a.Class, project, subject, a.Outcome)
+	}
+	return b.String()
 }
 
 // reapClosed calls fs reap once per project whose round just ended while the
@@ -426,6 +498,16 @@ func (e *engine) perform(a state.Action, run func() error) {
 		e.traceAction(a, actionRefused)
 		return
 	}
+	e.runAction(a, run)
+}
+
+// performUngated is perform without the 90 s gate. The inform needs no gate of
+// its own: a tick sends at most one, and only when it took an action.
+func (e *engine) performUngated(a state.Action, run func() error) {
+	e.runAction(a, run)
+}
+
+func (e *engine) runAction(a state.Action, run func() error) {
 	a.At = e.now
 	a.Outcome = state.ActionAttempted
 	id, err := e.put(a)

@@ -981,3 +981,159 @@ func TestAC21AClosedRoundIsAnnounced(t *testing.T) {
 		}
 	})
 }
+
+// seedClaim writes the cap.claim row a claiming session leaves, so the tick has
+// an address to report to.
+func seedClaim(t *testing.T, s state.Store, session, paneID string, expires time.Time) {
+	t.Helper()
+	text, err := state.Encode(state.Claim{Session: session, Pane: paneID, At: expires.Add(-state.ClaimLease), Expires: expires})
+	if err != nil {
+		t.Fatalf("encode claim: %v", err)
+	}
+	if _, err := s.Put(state.KindClaim, state.CursorScope, "claim "+session, text); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+}
+
+func TestAC22TheTickInformsTheClaimHolder(t *testing.T) {
+	// acted builds a watcher whose one dev task just left the board, so the
+	// tick takes one action: a reap.
+	acted := func(t *testing.T) (*fakeHarness, state.Store, *Watcher, *clock) {
+		t.Helper()
+		task := claimedTask("t-1", "cap", "p1", 1, true)
+		task.Goal = "fix the AC14 hole"
+		b := &fakeBoard{tasks: []board.Task{task}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working"), pane("p9", "claude", "idle")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		b.tasks = nil
+		return h, s, w, c
+	}
+
+	t.Run("one prompt naming the action by goal", func(t *testing.T) {
+		h, s, w, c := acted(t)
+		seedClaim(t, s, "s-coord", "p9", c.at.Add(state.ClaimLease))
+
+		r := tick(t, w, c, 30*time.Second)
+
+		if len(h.prompts) != 1 {
+			t.Fatalf("prompts = %v, want one to the claim holder", h.prompts)
+		}
+		if !strings.HasPrefix(h.prompts[0], "p9: ") {
+			t.Fatalf("prompt went to %q, want pane p9", h.prompts[0])
+		}
+		for _, want := range []string{"reap", "cap", `"fix the AC14 hole"`, "done"} {
+			if !strings.Contains(h.prompts[0], want) {
+				t.Fatalf("prompt = %q, want it to name %q", h.prompts[0], want)
+			}
+		}
+		if strings.Contains(h.prompts[0], "t-1") {
+			t.Fatalf("prompt = %q; tasks are named by goal, never by id", h.prompts[0])
+		}
+
+		var informs []state.Action
+		for _, a := range actionsIn(t, s, state.CursorScope) {
+			if a.Class == ClassInform && a.Outcome != state.ActionAttempted {
+				informs = append(informs, a)
+			}
+		}
+		if len(informs) != 1 || informs[0].Outcome != state.ActionDone || informs[0].Pane != "p9" {
+			t.Fatalf("inform rows = %+v, want one done row naming pane p9", informs)
+		}
+		if len(r.Actions) < 2 {
+			t.Fatalf("report actions = %+v, want the reap and the inform", r.Actions)
+		}
+	})
+
+	t.Run("no claim", func(t *testing.T) {
+		h, _, w, c := acted(t)
+		tick(t, w, c, 30*time.Second)
+		if len(h.prompts) != 0 {
+			t.Fatalf("prompts = %v; no claim means no address", h.prompts)
+		}
+	})
+
+	t.Run("stale claim", func(t *testing.T) {
+		h, s, w, c := acted(t)
+		seedClaim(t, s, "s-coord", "p9", c.at.Add(-time.Minute))
+		tick(t, w, c, 30*time.Second)
+		if len(h.prompts) != 0 {
+			t.Fatalf("prompts = %v; a stale claim has no address", h.prompts)
+		}
+	})
+
+	t.Run("claim without a pane", func(t *testing.T) {
+		h, s, w, c := acted(t)
+		seedClaim(t, s, "s-coord", "", c.at.Add(state.ClaimLease))
+		tick(t, w, c, 30*time.Second)
+		if len(h.prompts) != 0 {
+			t.Fatalf("prompts = %v; a claim with no pane has no address", h.prompts)
+		}
+	})
+
+	t.Run("the pane is not listed", func(t *testing.T) {
+		h, s, w, c := acted(t)
+		seedClaim(t, s, "s-coord", "p-gone", c.at.Add(state.ClaimLease))
+		tick(t, w, c, 30*time.Second)
+		if len(h.prompts) != 0 {
+			t.Fatalf("prompts = %v; an unlisted pane is not an address", h.prompts)
+		}
+	})
+
+	t.Run("the holder is blocked", func(t *testing.T) {
+		task := claimedTask("t-1", "cap", "p1", 1, true)
+		b := &fakeBoard{tasks: []board.Task{task}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working"), pane("p9", "claude", "blocked")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		seedClaim(t, s, "s-coord", "p9", c.at.Add(state.ClaimLease))
+
+		b.tasks = nil
+		tick(t, w, c, 30*time.Second)
+
+		if len(h.prompts) != 0 {
+			t.Fatalf("prompts = %v; a blocked pane is never prompted", h.prompts)
+		}
+	})
+
+	t.Run("a tick with no action", func(t *testing.T) {
+		task := claimedTask("t-1", "cap", "p1", 1, true)
+		b := &fakeBoard{tasks: []board.Task{task}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working"), pane("p9", "claude", "idle")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		seedClaim(t, s, "s-coord", "p9", c.at.Add(state.ClaimLease))
+
+		tick(t, w, c, 30*time.Second)
+		if len(h.prompts) != 0 {
+			t.Fatalf("prompts = %v; a tick that acted on nothing has nothing to report", h.prompts)
+		}
+	})
+
+	t.Run("a failed prompt is traced and not retried", func(t *testing.T) {
+		h, s, w, c := acted(t)
+		h.promptErr = errors.New("pane gone")
+		seedClaim(t, s, "s-coord", "p9", c.at.Add(state.ClaimLease))
+
+		tick(t, w, c, 30*time.Second)
+
+		if len(h.prompts) != 1 {
+			t.Fatalf("prompts = %v; a failed prompt is not retried in the tick", h.prompts)
+		}
+		var informs []state.Action
+		for _, a := range actionsIn(t, s, state.CursorScope) {
+			if a.Class == ClassInform && a.Outcome != state.ActionAttempted {
+				informs = append(informs, a)
+			}
+		}
+		if len(informs) != 1 || !strings.HasPrefix(informs[0].Outcome, state.ActionFailed) {
+			t.Fatalf("inform rows = %+v, want one failed row", informs)
+		}
+	})
+}

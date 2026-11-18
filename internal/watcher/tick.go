@@ -188,6 +188,7 @@ func snapshot(tasks []board.Task) []state.CursorTask {
 			Project:      t.Project,
 			Kind:         t.Kind,
 			State:        t.State,
+			Goal:         t.Goal,
 			Session:      t.Session,
 			Pane:         t.Process.Pane,
 			LeaseExpires: t.LeaseExpires,

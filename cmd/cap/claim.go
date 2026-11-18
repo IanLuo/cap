@@ -33,7 +33,13 @@ func takeClaim(store *state.MemStore, session string, now time.Time) error {
 	if reason := state.ClaimCheck(cur, session, now); reason != "" {
 		return fmt.Errorf("%s", reason)
 	}
-	return writeClaim(store, cur, session, now)
+	// A renewal keeps the pane the holder gave: the address is set once, when
+	// the holder names it, and no later verb erases it.
+	pane := ""
+	if cur != nil && cur.Session == session {
+		pane = cur.Pane
+	}
+	return writeClaim(store, cur, session, pane, now)
 }
 
 func openClaim(store *state.MemStore) (*state.Claim, error) {
@@ -46,13 +52,13 @@ func openClaim(store *state.MemStore) (*state.Claim, error) {
 
 // writeClaim closes the old claim and writes the new one. Records are
 // immutable: the renewal is a new row, never an edit.
-func writeClaim(store *state.MemStore, cur *state.Claim, session string, now time.Time) error {
+func writeClaim(store *state.MemStore, cur *state.Claim, session, pane string, now time.Time) error {
 	if cur != nil {
 		if err := store.Close(cur.ID); err != nil {
 			return fmt.Errorf("close cap.claim %d: %w", cur.ID, err)
 		}
 	}
-	text, err := state.Encode(state.Claim{Session: session, At: now, Expires: now.Add(state.ClaimLease)})
+	text, err := state.Encode(state.Claim{Session: session, Pane: pane, At: now, Expires: now.Add(state.ClaimLease)})
 	if err != nil {
 		return err
 	}
@@ -84,14 +90,23 @@ func claimCmd(o options, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "cap: %s\n", reason)
 		return 1
 	}
-	if err := writeClaim(store, cur, session, now); err != nil {
+	// --pane sets the address; a rename without one keeps the holder's.
+	pane := o.pane
+	if pane == "" && cur != nil && cur.Session == session {
+		pane = cur.Pane
+	}
+	if err := writeClaim(store, cur, session, pane, now); err != nil {
 		fmt.Fprintf(stderr, "cap: %v\n", err)
 		return 1
 	}
 	expires := now.Add(state.ClaimLease)
 	if o.json {
-		return emitJSON(stdout, stderr, claimJSON{Session: session, Expires: expires.UTC().Format(time.RFC3339), Held: true})
+		return emitJSON(stdout, stderr, claimJSON{Session: session, Pane: pane, Expires: expires.UTC().Format(time.RFC3339), Held: true})
 	}
-	fmt.Fprintf(stdout, "cap claimed by %s until %s\n", session, expires.UTC().Format(time.RFC3339))
+	if pane != "" {
+		fmt.Fprintf(stdout, "cap claimed by %s in pane %s until %s\n", session, pane, expires.UTC().Format(time.RFC3339))
+	} else {
+		fmt.Fprintf(stdout, "cap claimed by %s until %s\n", session, expires.UTC().Format(time.RFC3339))
+	}
 	return 0
 }

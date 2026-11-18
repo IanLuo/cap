@@ -94,6 +94,7 @@ type CursorTask struct {
 	Project      string     `json:"project"`
 	Kind         string     `json:"kind"`
 	State        string     `json:"state"`
+	Goal         string     `json:"goal,omitempty"`
 	Session      string     `json:"session,omitempty"`
 	Pane         string     `json:"pane,omitempty"`
 	LeaseExpires *time.Time `json:"lease_expires,omitempty"`

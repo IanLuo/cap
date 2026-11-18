@@ -12,9 +12,12 @@ const ClaimLease = 120 * time.Second
 // Claim is the one session allowed to run cap's write verbs, and until when.
 // It lives in cap:cap and is closed and rewritten on each holder write, like
 // every cap record. A claim coordinates; it does not authenticate a session id.
+// Pane, when the holder named one, is the tick's one address for telling the
+// holder what it did; it is self-declared for the same reason the id is.
 type Claim struct {
 	ID      int64     `json:"-"`
 	Session string    `json:"session"`
+	Pane    string    `json:"pane,omitempty"`
 	At      time.Time `json:"at"`
 	Expires time.Time `json:"expires"`
 }

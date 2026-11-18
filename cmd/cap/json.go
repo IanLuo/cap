@@ -64,10 +64,12 @@ type statusJSON struct {
 	Claim              claimJSON `json:"claim"`
 }
 
-// claimJSON names the session that holds cap's write verbs. Held is false when
-// the claim is stale or absent; Session then names the last holder.
+// claimJSON names the session that holds cap's write verbs and the pane it
+// gave as its address. Held is false when the claim is stale or absent; Session
+// then names the last holder.
 type claimJSON struct {
 	Session string `json:"session,omitempty"`
+	Pane    string `json:"pane,omitempty"`
 	Expires string `json:"expires,omitempty"`
 	Held    bool   `json:"held"`
 }
@@ -162,6 +164,7 @@ func newClaim(c *state.Claim, now time.Time) claimJSON {
 	}
 	return claimJSON{
 		Session: c.Session,
+		Pane:    c.Pane,
 		Expires: c.Expires.UTC().Format(time.RFC3339),
 		Held:    c.Live(now),
 	}
@@ -202,8 +205,12 @@ func (s statusJSON) Text() string {
 	switch {
 	case s.Claim.Session == "":
 		b.WriteString("cap claim: none\n")
+	case s.Claim.Held && s.Claim.Pane != "":
+		fmt.Fprintf(&b, "cap claim: held by %s in pane %s until %s\n", s.Claim.Session, s.Claim.Pane, s.Claim.Expires)
 	case s.Claim.Held:
 		fmt.Fprintf(&b, "cap claim: held by %s until %s\n", s.Claim.Session, s.Claim.Expires)
+	case s.Claim.Pane != "":
+		fmt.Fprintf(&b, "cap claim: stale, last held by %s in pane %s until %s\n", s.Claim.Session, s.Claim.Pane, s.Claim.Expires)
 	default:
 		fmt.Fprintf(&b, "cap claim: stale, last held by %s until %s\n", s.Claim.Session, s.Claim.Expires)
 	}

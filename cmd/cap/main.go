@@ -36,6 +36,7 @@ type options struct {
 	tail    int
 	confirm bool
 	session string
+	pane    string
 	args    []string
 }
 
@@ -58,6 +59,17 @@ func parseOpts(args []string) (options, error) {
 			o.session = strings.TrimPrefix(a, "--session=")
 			if o.session == "" {
 				return o, fmt.Errorf("--session needs an id")
+			}
+		case a == "--pane":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--pane needs an id")
+			}
+			i++
+			o.pane = args[i]
+		case strings.HasPrefix(a, "--pane="):
+			o.pane = strings.TrimPrefix(a, "--pane=")
+			if o.pane == "" {
+				return o, fmt.Errorf("--pane needs an id")
 			}
 		case a == "--tail":
 			if i+1 >= len(args) {

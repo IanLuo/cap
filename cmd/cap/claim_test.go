@@ -290,3 +290,42 @@ func TestClaimJSON(t *testing.T) {
 		t.Fatalf("claim json = %s, want test holding", out.String())
 	}
 }
+
+func TestClaimRecordsTheHoldersPane(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "memory.db")
+	t.Setenv("MEMSTORE_DB", dbPath)
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"claim", "--session", "coord", "--pane", "w9:p3", "--confirm"}, &out, &errOut); code != 0 {
+		t.Fatalf("claim exit = %d, stderr %s", code, errOut.String())
+	}
+	rows := claimRowList(t, dbPath)
+	if len(rows) != 1 {
+		t.Fatalf("claims = %+v, want one", rows)
+	}
+	c, err := state.DecodeClaim(rows[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pane != "w9:p3" {
+		t.Fatalf("claim pane = %q, want w9:p3", c.Pane)
+	}
+
+	// A renewal without --pane keeps the address the holder gave.
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"claim", "--session", "coord"}, &out, &errOut); code != 0 {
+		t.Fatalf("renew exit = %d, stderr %s", code, errOut.String())
+	}
+	rows = claimRowList(t, dbPath)
+	c, err = state.DecodeClaim(rows[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pane != "w9:p3" {
+		t.Fatalf("renewed claim pane = %q; a renewal keeps the address", c.Pane)
+	}
+	if !strings.Contains(out.String(), "w9:p3") {
+		t.Fatalf("stdout = %q, want the pane named", out.String())
+	}
+}
