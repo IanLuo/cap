@@ -1,4 +1,4 @@
-// Package state is cap's own memory: the five record kinds it owns, and the
+// Package state is cap's own memory: the six record kinds it owns, and the
 // only place that talks to memstore. It refuses any scope that is not cap's, so
 // the fs board can never be read through this package.
 package state
@@ -18,6 +18,9 @@ const (
 	KindClaim    = "cap.claim"
 	KindQuestion = "cap.question"
 	KindCursor   = "cap.cursor"
+	// KindRound is the durable record of one closed dev round. It is written
+	// once when the task leaves the board, so the news survives the toast.
+	KindRound = "cap.round"
 
 	// KnowledgeKind is the only foreign kind cap reads. Knowledge is how to
 	// start a worker; it is never a task row.
@@ -93,8 +96,8 @@ func (m *MemStore) Put(kind, scope, title, text string) (int64, error) {
 	if !strings.HasPrefix(scope, "cap:") {
 		return 0, fmt.Errorf("cap writes only cap: scopes, got %q", scope)
 	}
-	if kind != KindAct && kind != KindAction && kind != KindClaim && kind != KindQuestion && kind != KindCursor {
-		return 0, fmt.Errorf("cap owns five kinds, not %q", kind)
+	if kind != KindAct && kind != KindAction && kind != KindClaim && kind != KindQuestion && kind != KindCursor && kind != KindRound {
+		return 0, fmt.Errorf("cap owns six kinds, not %q", kind)
 	}
 	return m.db.Put(&memstore.Memory{Kind: kind, Scope: scope, Title: title, Text: text, Origin: "cap"})
 }

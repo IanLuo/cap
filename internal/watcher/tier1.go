@@ -137,10 +137,11 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 		}
 	}
 
-	e.announceClosed(changes)
+	e.announceClosed(changes, paneByID)
 	e.reapClosed(changes, paneByID)
-	// One voice: the holder hears the events first, and the toasts stand down
-	// when it did. Without a live holder the toast is the fallback.
+	// One voice: the holder hears the events first, the dispatcher that
+	// dispatched a closed round hears that round, and the toasts stand down
+	// when either did. Without them the toast is the fallback.
 	e.postToasts(e.inform(paneByID))
 	if e.err != nil {
 		return e.taken, e.refused, e.err
@@ -285,30 +286,212 @@ func (e *engine) recommendReap(project, task, pane, why string) {
 	}, actionRecommended)
 }
 
-// announceClosed posts one notification for a dev task that just left the
-// board: fs completes a dev task only through a review that ran its declared
-// checks, so the round is done and the review passed. The review task that
-// closed the same round is not announced again.
-func (e *engine) announceClosed(changes []Change) {
+// announceClosed records a dev task that just left the board and tells its
+// dispatcher. fs completes a dev task only through a review that ran its
+// declared checks, so the round is done and the review passed. The record is
+// written first and survives the popup; the prompt goes to the pane fs named
+// as the caller when it launched the task, so the session that dispatched the
+// work is told without polling. The review task that closed the same round is
+// neither recorded nor announced again.
+func (e *engine) announceClosed(changes []Change, paneByID map[string]agents.Pane) {
 	oldByTask := map[string]state.CursorTask{}
 	for _, t := range e.old.Tasks {
 		oldByTask[t.Task] = t
+	}
+	byTask := make(map[string]board.Task, len(e.tasks))
+	for _, t := range e.tasks {
+		byTask[t.Task] = t
 	}
 	for _, c := range changes {
 		if !strings.HasPrefix(c.Reason, "no longer open") {
 			continue
 		}
-		if o, ok := oldByTask[c.Task]; !ok || o.Kind != "dev" {
+		o, ok := oldByTask[c.Task]
+		if !ok || o.Kind != "dev" {
 			continue
 		}
 		e.events = append(e.events, Event{Kind: "finished", Project: c.Project, Task: c.Task})
+		if e.announceRound(c, o, byTask[c.Task], paneByID) {
+			continue // the dispatcher was told; the human needs no second popup
+		}
 		e.toasts = append(e.toasts, toast{title: "cap: round closed", body: c.Project + " " + c.Task + " done, review passed"})
 	}
 }
 
+// announceRound writes the closed round's durable record, then tells the
+// dispatcher through the pane fs recorded as its caller. It returns true when
+// the news reached a pane, or was already on record, so the toast knows whether
+// it is still the announcement. The record is written before any prompt: when
+// the write fails, the trace says so and no pane is addressed. A round already
+// on record is not written or announced a second time.
+func (e *engine) announceRound(c Change, o state.CursorTask, t board.Task, paneByID map[string]agents.Pane) bool {
+	rec := roundRecord(c, o, t, e.now)
+	a := state.Action{
+		Class:   ClassInform,
+		Target:  c.Task,
+		Project: c.Project,
+		Task:    c.Task,
+		Trigger: "round closed for task " + c.Task,
+	}
+
+	recorded, err := state.RoundRecorded(e.rows, c.Task)
+	if err != nil {
+		e.err = err
+		e.tracePath(a, state.ActionFailed+": "+err.Error(), "toast", "cap.round read failed; no prompt")
+		return false
+	}
+	if recorded {
+		// The tick that wrote the row announced the round. A replay after a
+		// failed cursor write must not write a second row or speak twice.
+		e.tracePath(a, state.ActionDone, "recorded", "cap.round already on record for this round")
+		return true
+	}
+	text, err := state.Encode(rec)
+	if err != nil {
+		e.err = err
+		e.tracePath(a, state.ActionFailed+": "+err.Error(), "toast", "cap.round encode failed; no prompt")
+		return false
+	}
+	if _, err := e.w.Store.Put(state.KindRound, state.Scope(c.Project), "round closed "+c.Task, text); err != nil {
+		e.err = fmt.Errorf("write cap.round: %w", err)
+		e.tracePath(a, state.ActionFailed+": "+e.err.Error(), "toast", "cap.round write failed; the caller was not prompted")
+		return false
+	}
+
+	caller := t.Process.CallerPane
+	a.Pane = caller
+	switch {
+	case caller == "":
+		e.tracePath(a, state.ActionDone, "toast", "fs recorded no caller pane")
+		return false
+	case caller == t.Process.Pane:
+		e.tracePath(a, state.ActionDone, "toast", "caller pane is the launched pane")
+		return false
+	case e.humanOwned(caller):
+		e.tracePath(a, state.ActionDone, "toast", "no fs launch row owns the caller pane")
+		return false
+	}
+	p, listed := paneByID[caller]
+	if !listed || p.Agent == "" || p.Status == "blocked" {
+		e.tracePath(a, state.ActionDone, "toast", "the caller pane is unlisted, empty or blocked")
+		return false
+	}
+	holder, err := e.claimPane(paneByID)
+	if err != nil {
+		e.err = err
+		e.tracePath(a, state.ActionFailed+": "+err.Error(), "toast", "cap.claim read failed; no prompt")
+		return false
+	}
+	if holder == caller {
+		e.tracePath(a, state.ActionDone, "holder", "the caller is the claim holder this tick informs")
+		return false // no second prompt; the toast stands down if that one lands
+	}
+	prompt := roundText(rec)
+	return e.announceTo(a, func() error { return e.w.Agents.Prompt(e.ctx, caller, prompt) }, "caller", "dispatcher pane from fs caller_pane")
+}
+
+// announceTo is performUngated for the closed-round announcement: it records
+// the attempt, runs it, and writes one trace line carrying the path the
+// announcement took and why. A one-off news prompt needs no 90 s gate; the
+// round record already keeps a repeated tick from announcing twice.
+func (e *engine) announceTo(a state.Action, run func() error, path, why string) bool {
+	a.At = e.now
+	a.Outcome = state.ActionAttempted
+	id, err := e.put(a)
+	if err != nil {
+		e.err = err
+		e.tracePath(a, state.ActionFailed+": "+err.Error(), path, why)
+		return false
+	}
+	a.ID = id
+	if err := run(); err != nil {
+		failed := state.ActionFailed + ": " + err.Error()
+		e.finish(a, failed)
+		e.refused = append(e.refused, a.Class+" "+a.Target+" failed: "+err.Error())
+		e.tracePath(a, failed, path, why)
+		return false
+	}
+	e.finish(a, state.ActionDone)
+	e.tracePath(a, state.ActionDone, path, why)
+	return true
+}
+
+// roundRecord builds the durable row for a closed round: its project and task,
+// the session that did the work, the review verdict, and the commit the newest
+// dev-done report named. The goal is kept so a later session can find the row
+// by what the work was.
+func roundRecord(c Change, o state.CursorTask, t board.Task, now time.Time) state.Round {
+	rec := state.Round{
+		Project: c.Project,
+		Task:    c.Task,
+		Round:   t.Round,
+		Goal:    t.Goal,
+		Verdict: "pass", // a dev task leaves the board only after its review passed
+		At:      now,
+	}
+	if rec.Goal == "" {
+		rec.Goal = o.Goal
+	}
+	rec.Session = t.Session
+	if rec.Session == "" {
+		rec.Session = o.Session
+	}
+	rec.Commit = commitOf(t)
+	if rec.Session == "" {
+		rec.Session = evidenceSession(t)
+	}
+	return rec
+}
+
+// commitOf is the commit the dev task's newest dev-done report named, falling
+// back to the newest report's digest. fs evidence is newest first.
+func commitOf(t board.Task) string {
+	any := ""
+	for _, ev := range t.Evidence {
+		if ev.Digest == "" {
+			continue
+		}
+		if any == "" {
+			any = ev.Digest
+		}
+		if ev.State == "dev-done" {
+			return ev.Digest
+		}
+	}
+	return any
+}
+
+// evidenceSession is the session that wrote the newest report. It is the
+// fallback when the board no longer names a holder for the closed task.
+func evidenceSession(t board.Task) string {
+	for _, ev := range t.Evidence {
+		if ev.Session != "" {
+			return ev.Session
+		}
+	}
+	return ""
+}
+
+// roundText renders the closed-round announcement for the dispatcher. The task
+// is named by goal, never by id: the reader is deciding what to do next.
+func roundText(rec state.Round) string {
+	subject := rec.Goal
+	if subject == "" {
+		subject = rec.Task
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "cap: round closed %s: %q review passed", rec.Project, subject)
+	if rec.Commit != "" {
+		fmt.Fprintf(&b, ", commit %s", rec.Commit)
+	}
+	b.WriteString(". Report only; nothing here asks a question.\n")
+	return b.String()
+}
+
 // postToasts sends the notifications the events would raise. One voice: when
-// the tick informed a live holder of these events, the human is spared the
-// duplicate. With no holder, the toast is the only announcement.
+// the tick informed a live holder of these events, or prompted the dispatcher
+// the closed round belonged to, the human is spared the duplicate. With
+// neither, the toast is the announcement.
 func (e *engine) postToasts(informed bool) {
 	if informed {
 		return
@@ -320,10 +503,28 @@ func (e *engine) postToasts(informed bool) {
 	}
 }
 
+// claimPane is the one pane this tick's inform will address, or empty when
+// there is no such address. The announce uses it to leave the claim holder's
+// prompt as the single voice for a round it would otherwise duplicate.
+func (e *engine) claimPane(paneByID map[string]agents.Pane) (string, error) {
+	claim, err := state.OpenClaim(e.rows)
+	if err != nil {
+		return "", err
+	}
+	if claim == nil || claim.Pane == "" {
+		return "", nil
+	}
+	p, listed := paneByID[claim.Pane]
+	if !listed || p.Agent == "" || p.Status == "blocked" {
+		return "", nil
+	}
+	return claim.Pane, nil
+}
+
 // inform tells the claim holder what this tick saw: one prompt, one line
 // per event, each naming its kind, project and task by goal. It is the one
-// message on the clock path addressed to a session. It returns true only when
-// the prompt was sent, so the toasts know whether to stand down. It reports; it
+// message on the clock path addressed to the claim holder. It returns true only
+// when the prompt was sent, so the toasts know whether to stand down. It reports; it
 // never instructs, never answers a blocked agent (so it never prompts a pane
 // the harness shows as blocked), and never changes what an action does.
 // The lease gates the write verbs, not this address: a lapsed claim still names
@@ -615,7 +816,21 @@ const actionRefused = "refused"
 // traceAction writes one line per tier-1 decision: its class, what it named,
 // why, and what happened. The trace never gates a decision.
 func (e *engine) traceAction(a state.Action, result string) {
-	e.w.trace(map[string]any{
+	e.w.trace(e.actionLine(a, result))
+}
+
+// tracePath is traceAction with the path a closed-round announcement took — the
+// dispatcher's pane ("caller"), the claim holder ("holder") or the human toast —
+// and why it took it.
+func (e *engine) tracePath(a state.Action, result, path, why string) {
+	ev := e.actionLine(a, result)
+	ev["path"] = path
+	ev["why"] = why
+	e.w.trace(ev)
+}
+
+func (e *engine) actionLine(a state.Action, result string) map[string]any {
+	return map[string]any{
 		"kind":    "action",
 		"at":      e.now.UTC().Format(time.RFC3339Nano),
 		"class":   a.Class,
@@ -625,7 +840,7 @@ func (e *engine) traceAction(a state.Action, result string) {
 		"pane":    a.Pane,
 		"trigger": a.Trigger,
 		"result":  result,
-	})
+	}
 }
 
 func (e *engine) gated(class, target string) *state.Action {

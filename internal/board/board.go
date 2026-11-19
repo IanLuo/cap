@@ -35,13 +35,15 @@ type Task struct {
 }
 
 // Process is what fs's launcher recorded for a task: one process fs started.
-// Status is working, idle, gone, or unknown. Pane and Name are empty when fs
-// holds no launch row for the task.
+// Status is working, idle, gone, or unknown. Pane, Name and CallerPane are
+// empty when fs holds no launch row for the task. CallerPane is the pane that
+// ran the dispatch, recorded by fs and empty when no caller was named.
 type Process struct {
-	Status   string     `json:"status"`
-	Pane     string     `json:"pane,omitempty"`
-	Name     string     `json:"name,omitempty"`
-	Launched *time.Time `json:"launched,omitempty"`
+	Status     string     `json:"status"`
+	Pane       string     `json:"pane,omitempty"`
+	Name       string     `json:"name,omitempty"`
+	Launched   *time.Time `json:"launched,omitempty"`
+	CallerPane string     `json:"caller_pane,omitempty"`
 }
 
 // Observed is what fs's status says an agent or runtime last reported.
@@ -56,11 +58,13 @@ type Observed struct {
 	Fresh    bool       `json:"fresh"`
 }
 
-// Evidence is one fs report on a task.
+// Evidence is one fs report on a task. Digest is what the reporter said the
+// work now is: a commit for a dev-done report.
 type Evidence struct {
 	State   string     `json:"state"`
 	Role    string     `json:"role,omitempty"`
 	Note    string     `json:"note,omitempty"`
+	Digest  string     `json:"digest,omitempty"`
 	Session string     `json:"session,omitempty"`
 	At      *time.Time `json:"at,omitempty"`
 	Age     *float64   `json:"age_seconds,omitempty"`

@@ -97,6 +97,22 @@ type CursorTask struct {
 	NewestReport *time.Time `json:"newest_report,omitempty"`
 }
 
+// Round is one finished round: the durable record of a dev task leaving the
+// board. A later session can find it with memstore search after the popup is
+// gone. It is written once per closed round, never rewritten, and a review
+// task that closes the same round writes none.
+type Round struct {
+	ID      int64     `json:"-"`
+	Project string    `json:"project"`
+	Task    string    `json:"task"`
+	Round   int       `json:"round,omitempty"`
+	Goal    string    `json:"goal,omitempty"`
+	Session string    `json:"session,omitempty"`
+	Verdict string    `json:"verdict"`
+	Commit  string    `json:"commit,omitempty"`
+	At      time.Time `json:"at"`
+}
+
 // Encode renders a record as the text memstore stores.
 func Encode(v any) (string, error) {
 	b, err := json.Marshal(v)
@@ -194,6 +210,34 @@ func CountActionsInRound(actions []Action, class, target string, round int) int 
 		}
 	}
 	return n
+}
+
+// DecodeRound reads one cap.round row.
+func DecodeRound(r Row) (Round, error) {
+	var rd Round
+	if err := json.Unmarshal([]byte(r.Text), &rd); err != nil {
+		return Round{}, fmt.Errorf("decode cap.round %d: %w", r.ID, err)
+	}
+	rd.ID = r.ID
+	return rd, nil
+}
+
+// RoundRecorded reports whether a closed round for this task is already on
+// record, so a repeated tick writes no second row.
+func RoundRecorded(rows []Row, task string) (bool, error) {
+	for _, r := range rows {
+		if r.Kind != KindRound {
+			continue
+		}
+		rd, err := DecodeRound(r)
+		if err != nil {
+			return false, err
+		}
+		if rd.Task == task {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // DecodeCursor reads one cap.cursor row.

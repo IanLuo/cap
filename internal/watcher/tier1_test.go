@@ -1240,3 +1240,344 @@ func TestAC22TheTickInformsTheClaimHolder(t *testing.T) {
 		}
 	})
 }
+
+// roundsIn returns every cap.round row the store holds, open or closed.
+func roundsIn(t *testing.T, s state.Store, scope string) []state.Round {
+	t.Helper()
+	rows, err := s.Recent(scope, 1000)
+	if err != nil {
+		t.Fatalf("read %s: %v", scope, err)
+	}
+	var out []state.Round
+	for _, r := range rows {
+		if r.Kind != state.KindRound {
+			continue
+		}
+		rd, err := state.DecodeRound(r)
+		if err != nil {
+			t.Fatalf("decode cap.round: %v", err)
+		}
+		out = append(out, rd)
+	}
+	return out
+}
+
+// wantPathLine returns the trace's single closed-round announcement line for a
+// path — caller, holder, toast or recorded — and checks it names what AC20 and
+// D3 require, plus the path and why.
+func wantPathLine(t *testing.T, tr *captureTrace, path string) map[string]any {
+	t.Helper()
+	var got []map[string]any
+	for _, e := range actionLines(tr) {
+		if e["path"] == path {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("trace lines with path %q = %d, want one: %v", path, len(got), actionLines(tr))
+	}
+	e := got[0]
+	for _, k := range []string{"class", "target", "project", "task", "pane", "trigger", "result", "why"} {
+		if _, ok := e[k]; !ok {
+			t.Fatalf("announcement line %v has no %q", e, k)
+		}
+	}
+	if e["why"] == "" {
+		t.Fatalf("announcement line %v does not say why it took path %q", e, path)
+	}
+	return e
+}
+
+// doneDev is the same task as the board now reports it: a closed dev task
+// whose newest report names its commit. The previous cursor still saw it open.
+func doneDev(t board.Task) board.Task {
+	at, _ := time.Parse(time.RFC3339, "2026-11-15T09:59:30Z")
+	d := t
+	d.State = "done"
+	d.Process.Status = "gone"
+	d.Session = "s-dev"
+	d.Evidence = []board.Evidence{{
+		State: "dev-done", Role: "dev", Note: "done", Digest: "abc1234",
+		Session: "s-dev", At: &at,
+	}}
+	return d
+}
+
+// callerRound builds a watcher where dev task t-1 has just closed and the pane
+// fs named as its caller is p2, owned by t-9, a second fs-launched task still
+// on the board. An fs launch row owns p2, which is what makes it addressable.
+func callerRound(t *testing.T, caller string) (*Watcher, *fakeHarness, state.Store, *clock, *captureTrace) {
+	t.Helper()
+	open := claimedTask("t-1", "cap", "p1", 1, false)
+	open.Kind = "dev"
+	open.Goal = "reach the dispatcher"
+	companion := claimedTask("t-9", "cap", "p2", 1, true)
+	companion.Goal = "other work"
+	b := &fakeBoard{tasks: []board.Task{open, companion}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle"), pane("p2", "claude", "idle")}}
+	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	tr := &captureTrace{}
+	w.Trace = tr
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+
+	done := doneDev(open)
+	done.Process.CallerPane = caller
+	b.tasks = []board.Task{done, companion}
+	return w, h, s, c, tr
+}
+
+// failRoundStore refuses the cap.round write, leaving the rest of the store
+// working: the tick must not prompt a pane when the record did not land.
+type failRoundStore struct {
+	state.Store
+	err error
+}
+
+func (f failRoundStore) Put(kind, scope, title, text string) (int64, error) {
+	if kind == state.KindRound {
+		return 0, f.err
+	}
+	return f.Store.Put(kind, scope, title, text)
+}
+
+// D3, durable: a dev round that closes leaves one cap.round row naming the
+// project, task, session, verdict and commit, so the record survives the popup
+// and a later session can find it with memstore search.
+func TestD3AClosedRoundIsRecorded(t *testing.T) {
+	open := claimedTask("t-1", "cap", "p1", 2, false)
+	open.Kind = "dev"
+	open.Goal = "make the round reach the dispatcher"
+	b := &fakeBoard{tasks: []board.Task{open}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
+	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+
+	b.tasks = []board.Task{doneDev(open)}
+	tick(t, w, c, 30*time.Second)
+
+	rounds := roundsIn(t, s, state.Scope("cap"))
+	if len(rounds) != 1 {
+		t.Fatalf("cap.round rows = %+v, want one", rounds)
+	}
+	got := rounds[0]
+	if got.Project != "cap" || got.Task != "t-1" || got.Session != "s-dev" || got.Verdict != "pass" || got.Commit != "abc1234" {
+		t.Fatalf("cap.round = %+v, want project, task, session, verdict pass and commit", got)
+	}
+	if got.Goal != open.Goal || got.Round != 2 {
+		t.Fatalf("cap.round = %+v, want the goal and round so a later session can find it", got)
+	}
+}
+
+// D3, durable: a review task that closes the same round adds no second row, and
+// a repeated tick adds none either.
+func TestD3TheReviewAddsNoSecondRow(t *testing.T) {
+	dev := claimedTask("t-1", "cap", "p1", 1, false)
+	dev.Kind = "dev"
+	rev := claimedTask("t-2", "cap", "p2", 1, false)
+	rev.Kind = "review"
+	rev.ParentDev = "t-1"
+	b := &fakeBoard{tasks: []board.Task{dev, rev}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle"), pane("p2", "claude", "idle")}}
+	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+
+	b.tasks = []board.Task{doneDev(dev), doneDev(rev)}
+	tick(t, w, c, 30*time.Second)
+	tick(t, w, c, 30*time.Second)
+
+	rounds := roundsIn(t, s, state.Scope("cap"))
+	if len(rounds) != 1 || rounds[0].Task != "t-1" {
+		t.Fatalf("cap.round rows = %+v, want one for the dev task t-1 only", rounds)
+	}
+}
+
+// D3, addressed: the dispatcher named by fs's caller_pane is prompted, and the
+// human toast stands down because the news already reached the right party.
+func TestD3TheDispatcherIsTold(t *testing.T) {
+	w, h, s, c, tr := callerRound(t, "p2")
+
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 1 || !strings.HasPrefix(h.prompts[0], "p2: ") {
+		t.Fatalf("prompts = %v, want one to the dispatcher's pane p2", h.prompts)
+	}
+	for _, want := range []string{"round closed", `"reach the dispatcher"`, "review passed", "abc1234"} {
+		if !strings.Contains(h.prompts[0], want) {
+			t.Fatalf("prompt = %q, want it to name %q", h.prompts[0], want)
+		}
+	}
+	if strings.Contains(h.prompts[0], "t-1") {
+		t.Fatalf("prompt = %q; tasks are named by goal, never by id", h.prompts[0])
+	}
+	if len(h.notified) != 0 {
+		t.Fatalf("notifications = %v; the dispatcher was told, so the toast stands down", h.notified)
+	}
+	line := wantPathLine(t, tr, "caller")
+	if line["result"] != state.ActionDone || line["pane"] != "p2" {
+		t.Fatalf("announcement line = %v, want done on pane p2", line)
+	}
+
+	tick(t, w, c, 30*time.Second)
+	if len(h.prompts) != 1 {
+		t.Fatalf("prompts = %v; a closed round is announced once", h.prompts)
+	}
+	if n := len(roundsIn(t, s, state.Scope("cap"))); n != 1 {
+		t.Fatalf("cap.round rows = %d, want one", n)
+	}
+}
+
+// D3: with no caller pane the announcement falls back to the human toast
+// exactly as AC21 does today, and the trace says which path it took and why.
+func TestD3NoCallerFallsBackToTheToast(t *testing.T) {
+	w, h, _, c, tr := callerRound(t, "")
+
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 0 {
+		t.Fatalf("prompts = %v; fs named no caller pane", h.prompts)
+	}
+	if len(h.notified) != 1 || !strings.Contains(h.notified[0], "cap: round closed") {
+		t.Fatalf("notifications = %v, want the AC21 toast as the fallback", h.notified)
+	}
+	line := wantPathLine(t, tr, "toast")
+	if !strings.Contains(line["why"].(string), "no caller pane") {
+		t.Fatalf("announcement line = %v, want the fallback reason", line)
+	}
+}
+
+// D3, the self-address guard: a caller pane equal to the launched pane is the
+// same agent talking to itself, so cap falls back to the toast.
+func TestD3TheCallerIsNotTheLaunchedPane(t *testing.T) {
+	w, h, _, c, tr := callerRound(t, "p1")
+
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 0 {
+		t.Fatalf("prompts = %v; the caller pane is the launched pane", h.prompts)
+	}
+	if len(h.notified) != 1 {
+		t.Fatalf("notifications = %v, want the toast fallback", h.notified)
+	}
+	line := wantPathLine(t, tr, "toast")
+	if !strings.Contains(line["why"].(string), "launched pane") {
+		t.Fatalf("announcement line = %v, want the self-address reason", line)
+	}
+}
+
+// D2: a pane no fs launch row owns is the user's, never an address. The toast
+// carries the news instead.
+func TestD3TheCallerPaneMustBeOwned(t *testing.T) {
+	w, h, _, c, tr := callerRound(t, "p3")
+	h.panes = append(h.panes, pane("p3", "claude", "idle"))
+
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 0 {
+		t.Fatalf("prompts = %v; no launch row owns p3", h.prompts)
+	}
+	if len(h.notified) != 1 {
+		t.Fatalf("notifications = %v, want the toast fallback", h.notified)
+	}
+	line := wantPathLine(t, tr, "toast")
+	if !strings.Contains(line["why"].(string), "launch row") {
+		t.Fatalf("announcement line = %v, want the ownership reason", line)
+	}
+}
+
+// D3: when the round's row did not land, no pane is prompted and the trace says
+// so; the toast is still the human's announcement.
+func TestD3NoPromptWhenTheRoundWriteFailed(t *testing.T) {
+	w, h, _, _, tr := callerRound(t, "p2")
+	w.Store = failRoundStore{Store: w.Store, err: errors.New("store refused")}
+
+	if _, err := w.Tick(context.Background()); err == nil {
+		t.Fatal("tick succeeded after the cap.round write was refused")
+	}
+
+	if len(h.prompts) != 0 {
+		t.Fatalf("prompts = %v; the round was not recorded", h.prompts)
+	}
+	if len(h.notified) != 1 {
+		t.Fatalf("notifications = %v, want the toast to remain", h.notified)
+	}
+	line := wantPathLine(t, tr, "toast")
+	if !strings.HasPrefix(line["result"].(string), state.ActionFailed) ||
+		!strings.Contains(line["why"].(string), "cap.round write failed") {
+		t.Fatalf("announcement line = %v, want a failed result naming the row write", line)
+	}
+}
+
+// D3, once per round: a round already on record is not recorded or announced
+// again, so a replay after a failed cursor write cannot duplicate the news.
+func TestD3ARecordedRoundIsNotAnnouncedAgain(t *testing.T) {
+	w, h, s, c, tr := callerRound(t, "p2")
+	text, err := state.Encode(state.Round{Project: "cap", Task: "t-1", Verdict: "pass", At: c.at})
+	if err != nil {
+		t.Fatalf("encode seeded round: %v", err)
+	}
+	if _, err := s.Put(state.KindRound, state.Scope("cap"), "round closed t-1", text); err != nil {
+		t.Fatalf("seed round row: %v", err)
+	}
+
+	tick(t, w, c, 30*time.Second)
+
+	if n := len(roundsIn(t, s, state.Scope("cap"))); n != 1 {
+		t.Fatalf("cap.round rows = %d, want the one already on record", n)
+	}
+	if len(h.prompts) != 0 || len(h.notified) != 0 {
+		t.Fatalf("prompts %v, notifications %v; the round was already announced", h.prompts, h.notified)
+	}
+	line := wantPathLine(t, tr, "recorded")
+	if line["result"] != state.ActionDone {
+		t.Fatalf("announcement line = %v, want done", line)
+	}
+}
+
+// D3, one voice: when the caller is the claim holder, the tick's inform carries
+// the news to that pane and the announce adds no second prompt.
+func TestD3TheCallerWhoIsTheHolderIsToldOnce(t *testing.T) {
+	w, h, s, c, tr := callerRound(t, "p2")
+	seedClaim(t, s, "s-coord", "p2", c.at.Add(state.ClaimLease))
+
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 1 {
+		t.Fatalf("prompts = %v, want the holder's one inform prompt", h.prompts)
+	}
+	if !strings.Contains(h.prompts[0], "finished") {
+		t.Fatalf("prompt = %q, want the holder's event line, not a second announcement", h.prompts[0])
+	}
+	if len(h.notified) != 0 {
+		t.Fatalf("notifications = %v; the holder was told", h.notified)
+	}
+	line := wantPathLine(t, tr, "holder")
+	if line["result"] != state.ActionDone || line["pane"] != "p2" {
+		t.Fatalf("announcement line = %v, want done naming the holder's pane", line)
+	}
+}
+
+// D3: a failed caller prompt is attempted once, traced failed, and leaves the
+// human toast as the fallback. A live prompt is never retried in the tick.
+func TestD3AFailedCallerPromptFallsBackToTheToast(t *testing.T) {
+	w, h, _, c, tr := callerRound(t, "p2")
+	h.promptErr = errors.New("pane gone")
+
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 1 {
+		t.Fatalf("prompts = %v; a failed prompt is not retried in the tick", h.prompts)
+	}
+	if len(h.notified) != 1 || !strings.Contains(h.notified[0], "cap: round closed") {
+		t.Fatalf("notifications = %v, want the toast fallback", h.notified)
+	}
+	line := wantPathLine(t, tr, "caller")
+	if !strings.HasPrefix(line["result"].(string), state.ActionFailed) {
+		t.Fatalf("announcement line = %v, want a failed result", line)
+	}
+}
