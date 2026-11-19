@@ -19,7 +19,7 @@ const (
 	ClassClose   = "close"
 	ClassNudge   = "nudge"
 	ClassBlocked = "blocked"
-	// ClassInform reports a tick's actions to the live claim holder. It is
+	// ClassInform reports a tick's events to the live claim holder. It is
 	// news, never an instruction: it answers nothing and starts nothing.
 	ClassInform = "inform"
 
@@ -149,7 +149,9 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 
 	e.announceClosed(changes)
 	e.reapClosed(changes, paneByID)
-	e.inform(paneByID)
+	// One voice: the holder hears the events first, and the toasts stand down
+	// when it did. Without a live holder the toast is the fallback.
+	e.postToasts(e.inform(paneByID))
 	if e.err != nil {
 		return e.taken, e.refused, e.err
 	}
@@ -179,6 +181,30 @@ type engine struct {
 	// reaped holds every project this tick already asked fs to reap. Several
 	// transitions can end one project's round; fs is asked once.
 	reaped map[string]bool
+	// events are what the tick tells the claim holder: a round finished, a
+	// reviewer said blocked, an agent is blocked. They are not actions; the
+	// tick changes nothing because of them.
+	events []Event
+	// toasts are the human notifications the events would raise, held until
+	// the tick knows whether the holder was informed of the same events.
+	toasts []toast
+}
+
+// Event is one thing worth telling the claim holder. Kind is "finished",
+// "blocked" or "review blocked". Task is empty for a pane no task owns; Where
+// then names what the agent was working in.
+type Event struct {
+	Kind    string
+	Project string
+	Task    string
+	Pane    string
+	Where   string
+}
+
+// toast is one notification, held back until the tick knows whether the claim
+// holder was told the same event.
+type toast struct {
+	title, body string
 }
 
 // reapOnce is the one reap cap takes for a project in a tick, whichever
@@ -237,45 +263,59 @@ func (e *engine) announceClosed(changes []Change) {
 		if o, ok := oldByTask[c.Task]; !ok || o.Kind != "dev" {
 			continue
 		}
-		if err := e.w.Agents.Notify(e.ctx, "cap: round closed", c.Project+" "+c.Task+" done, review passed"); err != nil {
-			e.refused = append(e.refused, "notify "+c.Task+": "+err.Error())
+		e.events = append(e.events, Event{Kind: "finished", Project: c.Project, Task: c.Task})
+		e.toasts = append(e.toasts, toast{title: "cap: round closed", body: c.Project + " " + c.Task + " done, review passed"})
+	}
+}
+
+// postToasts sends the notifications the events would raise. One voice: when
+// the tick informed a live holder of these events, the human is spared the
+// duplicate. With no holder, the toast is the only announcement.
+func (e *engine) postToasts(informed bool) {
+	if informed {
+		return
+	}
+	for _, n := range e.toasts {
+		if err := e.w.Agents.Notify(e.ctx, n.title, n.body); err != nil {
+			e.refused = append(e.refused, "notify "+n.title+": "+err.Error())
 		}
 	}
 }
 
-// inform tells the live claim holder what this tick did: one prompt, one line
-// per action, each naming its class, project, task by goal and outcome. It is
-// the one message on the clock path addressed to a session. It reports; it
+// inform tells the live claim holder what this tick saw: one prompt, one line
+// per event, each naming its kind, project and task by goal. It is the one
+// message on the clock path addressed to a session. It returns true only when
+// the prompt was sent, so the toasts know whether to stand down. It reports; it
 // never instructs, never answers a blocked agent (so it never prompts a pane
 // the harness shows as blocked), and never changes what an action does.
-func (e *engine) inform(paneByID map[string]agents.Pane) {
-	if len(e.taken) == 0 {
-		return
+func (e *engine) inform(paneByID map[string]agents.Pane) bool {
+	if len(e.events) == 0 {
+		return false
 	}
 	claim, err := state.OpenClaim(e.rows)
 	if err != nil {
 		e.err = err
-		return
+		return false
 	}
 	if claim == nil || claim.Pane == "" || !claim.Live(e.now) {
-		return
+		return false
 	}
 	p, listed := paneByID[claim.Pane]
 	if !listed || p.Agent == "" || p.Status == "blocked" {
-		return
+		return false
 	}
 	a := state.Action{
 		Class:   ClassInform,
 		Target:  claim.Session,
 		Pane:    claim.Pane,
-		Trigger: fmt.Sprintf("%d actions this tick", len(e.taken)),
+		Trigger: fmt.Sprintf("%d event(s) this tick", len(e.events)),
 	}
 	text := e.informText()
-	e.performUngated(a, func() error { return e.w.Agents.Prompt(e.ctx, claim.Pane, text) })
+	return e.performUngated(a, func() error { return e.w.Agents.Prompt(e.ctx, claim.Pane, text) })
 }
 
-// informText renders the tick's actions for the claim holder. Tasks are named
-// by goal, never by id: the reader of this line is deciding what to do next.
+// informText renders the tick's events for the claim holder. Tasks are named by
+// goal, never by id: the reader of this line is deciding what to do next.
 func (e *engine) informText() string {
 	goals := make(map[string]string, len(e.tasks))
 	if e.old != nil {
@@ -288,23 +328,21 @@ func (e *engine) informText() string {
 		goals[t.Task] = t.Goal
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "cap: %d action(s) this tick. Report only; nothing here asks a question.\n", len(e.taken))
-	for _, a := range e.taken {
-		project := a.Project
+	fmt.Fprintf(&b, "cap: %d event(s) this tick. Report only; nothing here asks a question.\n", len(e.events))
+	for _, ev := range e.events {
+		project := ev.Project
 		if project == "" {
 			project = "cap"
 		}
-		subject := a.Trigger
-		for id, goal := range goals {
-			if goal == "" {
-				continue
-			}
-			subject = strings.ReplaceAll(subject, id, `"`+goal+`"`)
+		subject := goals[ev.Task]
+		if subject == "" {
+			subject = ev.Where
 		}
-		if a.Task != "" && goals[a.Task] != "" {
-			subject = `"` + goals[a.Task] + `"`
+		if ev.Kind == "finished" {
+			fmt.Fprintf(&b, "- finished %s: %q review passed\n", project, subject)
+			continue
 		}
-		fmt.Fprintf(&b, "- %s %s: %s -> %s\n", a.Class, project, subject, a.Outcome)
+		fmt.Fprintf(&b, "- %s %s: %q in pane %s\n", ev.Kind, project, subject, ev.Pane)
 	}
 	return b.String()
 }
@@ -354,6 +392,11 @@ func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
 			e.reapOnce(t.Project, "lease lapsed on task "+t.Task+", pane "+t.Process.Pane+" still open")
 		case reviewVerdictEnded(o, t):
 			e.reapOnce(t.Project, "review verdict "+t.Agent.Reported+" on task "+t.Task+", pane "+t.Process.Pane+" still open")
+			// A recoverable fail is the developer's business. A reviewer that
+			// says blocked cannot go on without a human.
+			if t.Agent.Reported == "blocked" {
+				e.events = append(e.events, Event{Kind: "review blocked", Project: t.Project, Task: t.Task, Pane: t.Process.Pane})
+			}
 		}
 	}
 }
@@ -432,11 +475,8 @@ func (e *engine) blocked(t board.Task, p agents.Pane) {
 		}
 	}
 	body := fmt.Sprintf("%s %s — %s (pane %s)", t.Project, t.Task, t.Goal, p.ID)
-	if err := e.w.Agents.Notify(e.ctx, "cap: agent blocked", body); err != nil {
-		e.refused = append(e.refused, "notify "+t.Task+": "+err.Error())
-		e.traceAction(a, state.ActionFailed+": "+err.Error())
-		return
-	}
+	e.events = append(e.events, Event{Kind: "blocked", Project: t.Project, Task: t.Task, Pane: p.ID})
+	e.toasts = append(e.toasts, toast{title: "cap: agent blocked", body: body})
 	e.traceAction(a, state.ActionDone)
 }
 
@@ -457,11 +497,8 @@ func (e *engine) blockedOrphan(p agents.Pane) {
 		e.orphanAsked = true
 	}
 	body := fmt.Sprintf("unowned agent blocked in %s (pane %s)", p.CWD, p.ID)
-	if err := e.w.Agents.Notify(e.ctx, "cap: agent blocked", body); err != nil {
-		e.refused = append(e.refused, "notify "+p.ID+": "+err.Error())
-		e.traceAction(a, state.ActionFailed+": "+err.Error())
-		return
-	}
+	e.events = append(e.events, Event{Kind: "blocked", Pane: p.ID, Where: p.CWD})
+	e.toasts = append(e.toasts, toast{title: "cap: agent blocked", body: body})
 	e.traceAction(a, state.ActionDone)
 }
 
@@ -502,19 +539,21 @@ func (e *engine) perform(a state.Action, run func() error) {
 }
 
 // performUngated is perform without the 90 s gate. The inform needs no gate of
-// its own: a tick sends at most one, and only when it took an action.
-func (e *engine) performUngated(a state.Action, run func() error) {
-	e.runAction(a, run)
+// its own: a tick sends at most one, and only when it saw an event.
+func (e *engine) performUngated(a state.Action, run func() error) bool {
+	return e.runAction(a, run)
 }
 
-func (e *engine) runAction(a state.Action, run func() error) {
+// runAction records the attempt, runs the side effect, and closes the attempt
+// with its outcome. It reports whether the side effect succeeded.
+func (e *engine) runAction(a state.Action, run func() error) bool {
 	a.At = e.now
 	a.Outcome = state.ActionAttempted
 	id, err := e.put(a)
 	if err != nil {
 		e.err = err
 		e.traceAction(a, state.ActionFailed+": "+err.Error())
-		return
+		return false
 	}
 	a.ID = id
 	if run != nil {
@@ -522,11 +561,12 @@ func (e *engine) runAction(a state.Action, run func() error) {
 			e.finish(a, state.ActionFailed+": "+err.Error())
 			e.refused = append(e.refused, a.Class+" "+a.Target+" failed: "+err.Error())
 			e.traceAction(a, state.ActionFailed+": "+err.Error())
-			return
+			return false
 		}
 	}
 	e.finish(a, state.ActionDone)
 	e.traceAction(a, state.ActionDone)
+	return true
 }
 
 // actionRefused is the trace result for a decision the gate or a round bound
