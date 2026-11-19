@@ -108,7 +108,7 @@ func (w *Watcher) Tick(ctx context.Context) (Report, error) {
 
 	nextPanes := oldPanes(old)
 	if harnessOK {
-		nextPanes = paneSnapshot(panes, old, now)
+		nextPanes = paneSnapshot(panes)
 	}
 	panesChanged := harnessOK && (old == nil || !samePanes(old.Panes, nextPanes))
 

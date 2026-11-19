@@ -23,27 +23,23 @@ const (
 	// news, never an instruction: it answers nothing and starts nothing.
 	ClassInform = "inform"
 
-	// DefaultCloseGrace is how long an empty pane with no launch row must be
-	// seen before cap closes it. A transition starts the timer; the grace only
-	// delays an action already triggered.
-	DefaultCloseGrace = 300 * time.Second
-
 	// maxNudgesPerRound bounds prompts to one stalled agent in one fs round.
 	maxNudgesPerRound = 2
 )
 
-func (w *Watcher) closeGrace() time.Duration {
-	if w.CloseGrace == 0 {
-		return DefaultCloseGrace
-	}
-	return w.CloseGrace
-}
+// actionRecommended is the trace result for a reap cap did not take because the
+// agent in its pane is still working. It is a decision, not an action: no row
+// is written and no side effect runs. The trace names the task and the pane.
+const actionRecommended = "recommended"
 
 // tier1 reads the transitions between the previous cursor and this tick and
 // takes at most one action per task and class inside the gate. It never
-// dispatches, never closes an fs-launched pane, and never answers a blocked
-// agent. It then tells the live claim holder what it did, in one prompt.
-// A side effect that fails is recorded and reported, not retried.
+// dispatches, never closes a pane, and never answers a blocked agent. It then
+// tells the live claim holder what it did, in one prompt.
+// A close is fs's, and only fs's: an fs-launched pane is reaped through fs when
+// its round is over and its agent is no longer working. A pane with no launch
+// row is the user's own (see humanOwned). A side effect that fails is recorded
+// and reported, not retried.
 // paneBaseline says the previous cursor holds no pane snapshot, so no pane can
 // have moved; the reap keys off the board change instead, and still runs.
 // Without a previous cursor at all there is nothing to compare: the tick is the
@@ -60,6 +56,13 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 	for _, p := range panes {
 		paneByID[p.ID] = p
 	}
+	launchByPane := map[string]board.Task{}
+	for _, t := range tasks {
+		if t.Process.Pane != "" {
+			launchByPane[t.Process.Pane] = t
+		}
+	}
+	e.launch = launchByPane
 	if old == nil || paneBaseline {
 		e.reapBaseline(paneByID)
 	}
@@ -68,12 +71,6 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 		return e.taken, e.refused, e.err
 	}
 
-	launchByPane := map[string]board.Task{}
-	for _, t := range tasks {
-		if t.Process.Pane != "" {
-			launchByPane[t.Process.Pane] = t
-		}
-	}
 	oldPanes := map[string]state.CursorPane{}
 	for _, p := range old.Panes {
 		oldPanes[p.Pane] = p
@@ -92,30 +89,23 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 		prev, seen := oldPanes[id]
 		transition := !seen || prev.Status != p.Status || prev.Agent != p.Agent
 
-		if p.Agent == "" {
-			if _, fsOwned := launchByPane[id]; fsOwned {
-				continue // fs closes its own panes; class 4 owns that
-			}
-			if !seen || transition {
-				continue // the grace starts now, or restarts on a new class
-			}
-			if !prev.WasAgent {
-				continue // never ran an agent: a human terminal, not an orphan
-			}
-			if e.now.Sub(prev.First) >= w.closeGrace() {
-				e.closeEmpty(p, prev.First)
+		if e.humanOwned(id) {
+			// No fs launch row owns this pane: it is the user's own. cap
+			// never closes it, never prompts it, never claims it. A blocked
+			// one is announced, never answered.
+			if p.Agent != "" && p.Status == "blocked" && transition {
+				e.blockedOrphan(p)
 			}
 			continue
 		}
 
-		t, launched := launchByPane[id]
+		t, launched := e.launch[id]
 		if !launched {
-			// An agent pane no launch row owns is human-owned. cap only
-			// announces a blocked one; it never closes it.
-			if p.Status == "blocked" && transition {
-				e.blockedOrphan(p)
-			}
+			// The launch row left with its task; fs still owns the close.
 			continue
+		}
+		if p.Agent == "" {
+			continue // fs closes its own panes; class 4 owns that
 		}
 		// fs keeps a working agent at its round's close. When that pane stops
 		// working, the harness transition is the trigger to ask fs again: fs
@@ -167,6 +157,9 @@ type engine struct {
 	panes   []agents.Pane
 	rows    []state.Row
 	actions []state.Action
+	// launch maps a pane to the open fs task whose launch row owns it. A pane
+	// absent from this map (and from the previous cursor) is human-owned.
+	launch  map[string]board.Task
 	taken   []state.Action
 	refused []string
 	err     error
@@ -174,9 +167,9 @@ type engine struct {
 	// board-wide gap: rows were read at tick start and cannot see a question
 	// written moments earlier in the same tick.
 	orphanAsked bool
-	// spoken holds every task cap nudged or announced this tick. The reap
-	// skips their panes: fs closes an idle agent on a lapsed lease, and cap
-	// does not close a pane it just asked the human or the agent to answer.
+	// spoken holds every task cap nudged or announced this tick. The
+	// harness-transition reap skips their panes: cap does not reap a pane it
+	// just asked the human or the agent to answer.
 	spoken map[string]bool
 	// reaped holds every project this tick already asked fs to reap. Several
 	// transitions can end one project's round; fs is asked once.
@@ -225,7 +218,8 @@ func (e *engine) reapOnce(project, why string) {
 // reapBaseline is the first observation's one act: one fs reap for every
 // project that still has an fs launch row whose pane is open in the harness.
 // The cursor cannot witness a round that ended while cap was not running, so
-// the open pane is the evidence.
+// the open pane is the evidence. Only launch rows are iterated: a pane no row
+// owns is human-owned and is never named here (see humanOwned).
 func (e *engine) reapBaseline(paneByID map[string]agents.Pane) {
 	for _, t := range e.tasks {
 		if t.Process.Pane == "" {
@@ -245,6 +239,50 @@ func roundOver(t board.Task) bool {
 		return true
 	}
 	return t.Agent.Role == "review" && (t.Agent.Reported == "fail" || t.Agent.Reported == "blocked")
+}
+
+// humanOwned reports whether no fs launch row owns the pane. Such a pane is the
+// user's own: cap never closes it, never prompts it, never claims it. This is
+// the one place the rule lives; every path that resolves a pane from the
+// harness asks it first. The evidence of a launch row is the open task fs
+// started there now, or the row the previous cursor kept for a task that has
+// just left the board: its launch row goes with the round, but fs still owns
+// the pane. The inform path is not a pane resolution — it addresses the claim's
+// pane, which the holder declared — so its rule is unchanged.
+func (e *engine) humanOwned(paneID string) bool {
+	if _, ok := e.launch[paneID]; ok {
+		return false
+	}
+	if e.old != nil {
+		for _, t := range e.old.Tasks {
+			if t.Pane == paneID {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// working reports whether the harness still shows an agent at work in the
+// pane. A pane with no agent, or one whose agent is idle, blocked, done, gone
+// or unknown, is not working: its round's pane may be reaped.
+func working(p agents.Pane) bool {
+	return p.Agent != "" && p.Status == "working"
+}
+
+// recommendReap records a reap cap did not take: the round is over but the
+// agent is still working, so fs kept the pane. The line names the task and the
+// pane and changes nothing; the harness transition out of working is the
+// trigger to act on the next tick.
+func (e *engine) recommendReap(project, task, pane, why string) {
+	e.traceAction(state.Action{
+		Class:   ClassReap,
+		Target:  project,
+		Project: project,
+		Task:    task,
+		Pane:    pane,
+		Trigger: why,
+	}, actionRecommended)
 }
 
 // announceClosed posts one notification for a dev task that just left the
@@ -349,10 +387,13 @@ func (e *engine) informText() string {
 	return b.String()
 }
 
-// reapClosed calls fs reap once per project whose round just ended while the
-// pane fs launched is still open. fs decides which pane to close; cap notices
-// the transition that ended the round: the task left the board, its lease
-// lapsed, or its session's newest review word became fail or blocked.
+// reapClosed calls fs reap once per project whose round just ended and whose
+// fs-launched pane no longer holds a working agent. fs decides which pane to
+// close; cap never closes an fs pane. A close needs both: a launch row for a
+// task whose round is over, and an agent that is no longer working. A lease
+// lapse alone is not a round over. When the round is over and the agent still
+// works, the tick records a recommendation in the trace and leaves the pane;
+// the harness transition out of working is the trigger to reap it.
 func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
 	if e.w.Reap == nil || e.old == nil {
 		return
@@ -371,34 +412,39 @@ func (e *engine) reapClosed(changes []Change, paneByID map[string]agents.Pane) {
 		if !ok || o.Pane == "" {
 			continue
 		}
-		if _, open := paneByID[o.Pane]; !open {
+		p, open := paneByID[o.Pane]
+		if !open || e.humanOwned(o.Pane) {
+			continue
+		}
+		if working(p) {
+			e.recommendReap(c.Project, c.Task, o.Pane, "D1: round closed for task "+c.Task+", agent still working")
 			continue
 		}
 		e.reapOnce(c.Project, "round closed for task "+c.Task+", pane "+o.Pane+" still open")
 	}
 
-	// A task still on the board whose round ended without the task closing.
+	// A task still on the board whose round ended with a review verdict.
 	for _, t := range e.tasks {
 		if t.Process.Pane == "" {
 			continue
 		}
-		if _, open := paneByID[t.Process.Pane]; !open {
+		p, open := paneByID[t.Process.Pane]
+		if !open || e.humanOwned(t.Process.Pane) {
 			continue
 		}
 		o, known := oldByTask[t.Task]
-		if !known {
+		if !known || !reviewVerdictEnded(o, t) {
 			continue
 		}
-		switch {
-		case o.LeaseLive && !t.LeaseLive && !e.spoken[t.Task]:
-			e.reapOnce(t.Project, "lease lapsed on task "+t.Task+", pane "+t.Process.Pane+" still open")
-		case reviewVerdictEnded(o, t):
+		if working(p) {
+			e.recommendReap(t.Project, t.Task, t.Process.Pane, "D1: review verdict "+t.Agent.Reported+" on task "+t.Task+", agent still working")
+		} else {
 			e.reapOnce(t.Project, "review verdict "+t.Agent.Reported+" on task "+t.Task+", pane "+t.Process.Pane+" still open")
-			// A recoverable fail is the developer's business. A reviewer that
-			// says blocked cannot go on without a human.
-			if t.Agent.Reported == "blocked" {
-				e.events = append(e.events, Event{Kind: "review blocked", Project: t.Project, Task: t.Task, Pane: t.Process.Pane})
-			}
+		}
+		// A recoverable fail is the developer's business. A reviewer that
+		// says blocked cannot go on without a human.
+		if t.Agent.Reported == "blocked" {
+			e.events = append(e.events, Event{Kind: "review blocked", Project: t.Project, Task: t.Task, Pane: t.Process.Pane})
 		}
 	}
 }
@@ -414,15 +460,6 @@ func reviewVerdictEnded(o state.CursorTask, t board.Task) bool {
 		return false
 	}
 	return o.NewestReport == nil || t.Agent.At.After(*o.NewestReport)
-}
-
-func (e *engine) closeEmpty(p agents.Pane, first time.Time) {
-	e.perform(state.Action{
-		Class:   ClassClose,
-		Target:  p.ID,
-		Pane:    p.ID,
-		Trigger: "orphaned pane, empty since " + first.UTC().Format(time.RFC3339),
-	}, func() error { return e.w.Agents.Close(e.ctx, p.ID) })
 }
 
 func (e *engine) nudge(t board.Task, p agents.Pane) {
@@ -641,28 +678,13 @@ func actionTitle(a state.Action) string {
 	return a.Class + " " + a.Target
 }
 
-// paneSnapshot carries the harness read into the cursor. First preserves the
-// first sighting of a pane in the same class, so the close grace survives
-// replays; WasAgent remembers that the pane once ran an agent, which is what
-// makes an empty pane an orphan rather than a terminal.
-func paneSnapshot(panes []agents.Pane, old *state.Cursor, now time.Time) []state.CursorPane {
-	oldFirst := map[string]state.CursorPane{}
-	if old != nil {
-		for _, p := range old.Panes {
-			oldFirst[p.Pane] = p
-		}
-	}
+// paneSnapshot carries the harness read into the cursor. The comparison fields
+// are what a later tick needs to see a transition; the cursor needs no history
+// of its own beyond At.
+func paneSnapshot(panes []agents.Pane) []state.CursorPane {
 	out := make([]state.CursorPane, 0, len(panes))
 	for _, p := range panes {
-		first := now
-		was := p.Agent != ""
-		if o, ok := oldFirst[p.ID]; ok {
-			was = was || o.WasAgent || o.Agent != ""
-			if (o.Agent == "") == (p.Agent == "") {
-				first = o.First
-			}
-		}
-		out = append(out, state.CursorPane{Pane: p.ID, Agent: p.Agent, Status: p.Status, CWD: p.CWD, First: first, WasAgent: was})
+		out = append(out, state.CursorPane{Pane: p.ID, Agent: p.Agent, Status: p.Status, CWD: p.CWD})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Pane < out[j].Pane })
 	return out

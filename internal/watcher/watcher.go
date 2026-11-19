@@ -42,14 +42,13 @@ type Launcher interface {
 // work. Its only side effects are the tier-1 actions, each gated and recorded
 // before it runs.
 type Watcher struct {
-	Board      board.Reader
-	Reap       board.Reaper
-	Agents     agents.Harness
-	Store      state.Store
-	Trace      Trace
-	Now        func() time.Time
-	Gate       time.Duration
-	CloseGrace time.Duration
+	Board  board.Reader
+	Reap   board.Reaper
+	Agents agents.Harness
+	Store  state.Store
+	Trace  Trace
+	Now    func() time.Time
+	Gate   time.Duration
 }
 
 // Dispatcher is the on-demand path: one task the user named, one command.

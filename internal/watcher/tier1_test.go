@@ -64,7 +64,6 @@ func tierWatcher(b board.Reader, s state.Store, h agents.Harness, r board.Reaper
 	w := testWatcher(b, s, c)
 	w.Agents = h
 	w.Reap = r
-	w.CloseGrace = time.Minute
 	return w
 }
 
@@ -124,7 +123,7 @@ func seedNudge(t *testing.T, s state.Store, task string, round int, at time.Time
 // baseline reap runs and no earlier action closes the gate.
 func seedCursor(t *testing.T, s state.Store, at time.Time, tasks []board.Task, panes []agents.Pane) {
 	t.Helper()
-	text, err := state.Encode(state.Cursor{At: at, Tasks: snapshot(tasks), Panes: paneSnapshot(panes, nil, at)})
+	text, err := state.Encode(state.Cursor{At: at, Tasks: snapshot(tasks), Panes: paneSnapshot(panes)})
 	if err != nil {
 		t.Fatalf("encode cursor: %v", err)
 	}
@@ -169,7 +168,7 @@ func TestAC14TierOneActsOnlyOnTransitions(t *testing.T) {
 	b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
 	s, _ := newStorePath(t)
 	c := newClock("2026-11-15T10:00:00Z")
-	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
 	rp := &fakeReaper{}
 	w := tierWatcher(b, s, h, rp, c)
 	seedCursor(t, s, c.at, b.tasks, h.panes) // the previous tick saw the round open
@@ -224,9 +223,10 @@ func TestAC14ReapsOnTheBaselineTick(t *testing.T) {
 	}
 }
 
-// AC14, round ended without the task closing: a lapsed lease reaps once the
-// round's nudges are spent, and a fresh review verdict reaps at once. A pane
-// cap just spoke to is not reaped in that tick.
+// AC14, round ended without the task closing: a fresh review verdict reaps at
+// once, and a pane cap just spoke to is not reaped in that tick. A lapsed lease
+// is not a round over under D1: it reaps nothing and closes nothing, whatever
+// the agent is doing.
 func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
 	t.Run("lease lapsed, nudges spent", func(t *testing.T) {
 		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
@@ -246,28 +246,24 @@ func TestAC14ReapsARoundThatEndedOnTheBoard(t *testing.T) {
 		if len(h.prompts) != 0 {
 			t.Fatalf("prompts = %d; the round's nudges are spent", len(h.prompts))
 		}
-		if len(rp.calls) != 1 || rp.calls[0] != "cap" {
-			t.Fatalf("reap calls = %v, want exactly [cap]", rp.calls)
+		if len(rp.calls) != 0 {
+			t.Fatalf("reap calls = %v; a lease lapse alone never reaps a pane", rp.calls)
 		}
 		if len(h.closed) != 0 {
 			t.Fatalf("cap closed %v; only fs closes an fs-launched pane", h.closed)
 		}
-		var reaped bool
 		for _, a := range report.Actions {
 			if a.Class == ClassReap {
-				reaped = true
+				t.Fatalf("actions = %+v; a lease lapse is not a round over", report.Actions)
 			}
 		}
-		if !reaped {
-			t.Fatalf("actions = %+v, want a reap", report.Actions)
+		if len(report.Refused) != 1 || !strings.Contains(report.Refused[0], "already nudged 2 times") {
+			t.Fatalf("refused = %v, want the spent nudge bound named", report.Refused)
 		}
 
 		quiet := tick(t, w, c, 30*time.Second)
-		if len(rp.calls) != 1 {
-			t.Fatalf("reap calls = %v after the transition passed; a reap is not repeated", rp.calls)
-		}
-		if len(quiet.Actions) != 0 {
-			t.Fatalf("actions = %+v on an unchanged tick", quiet.Actions)
+		if len(rp.calls) != 0 || len(quiet.Actions) != 0 {
+			t.Fatalf("reap calls = %v, actions = %+v on an unchanged tick", rp.calls, quiet.Actions)
 		}
 	})
 
@@ -445,81 +441,157 @@ func TestAC16NudgeIsBounded(t *testing.T) {
 	})
 }
 
-// AC17: an orphaned pane — one that held an agent and lost it — closes only
-// after the grace. A pane that never held an agent is a human terminal: never
-// closed. A failed close is recorded once and not retried inside the gate.
-func TestAC17AnOrphanClosesOnlyWhenEmpty(t *testing.T) {
-	b := &fakeBoard{}
+// D2: a pane with no fs launch row is human-owned. cap never closes it, never
+// prompts it, never claims it — including the empty-pane grace timer that used
+// to close an orphan. A blocked one is only announced, which AC18 covers.
+func TestD2APaneWithNoLaunchRowIsNeverAddressed(t *testing.T) {
+	t.Run("an empty pane, far past the old grace", func(t *testing.T) {
+		b := &fakeBoard{}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p-orphan", "claude", "idle")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+
+		if _, err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("first tick: %v", err)
+		}
+		h.panes = []agents.Pane{pane("p-orphan", "", "")} // its agent ended
+		for i := 0; i < 10; i++ {
+			tick(t, w, c, time.Minute) // ten minutes: far past the old 300 s grace
+		}
+		if len(h.closed) != 0 {
+			t.Fatalf("closed %v; a pane with no launch row is human-owned", h.closed)
+		}
+		if len(h.prompts) != 0 {
+			t.Fatalf("prompted %v; a pane with no launch row is never addressed", h.prompts)
+		}
+		if len(rp.calls) != 0 {
+			t.Fatalf("reaped %v; a pane with no launch row has no fs round to reap", rp.calls)
+		}
+	})
+
+	t.Run("an idle agent", func(t *testing.T) {
+		b := &fakeBoard{}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p-human", "claude", "idle")}}
+		w := tierWatcher(b, s, h, &fakeReaper{}, c)
+
+		if _, err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("first tick: %v", err)
+		}
+		for i := 0; i < 5; i++ {
+			tick(t, w, c, time.Minute)
+		}
+		if len(h.prompts) != 0 || len(h.closed) != 0 {
+			t.Fatalf("cap prompted %v or closed %v; a pane with no launch row is human-owned", h.prompts, h.closed)
+		}
+	})
+}
+
+// D1: a lease lapse alone never closes anything. With the agent still working
+// the tick records no action, no reap, no prompt and no trace line. The round
+// is still open: it ended neither by a task close nor by a review verdict.
+func TestD1LeaseLapseWithWorkingAgentDoesNothing(t *testing.T) {
+	b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
 	s, _ := newStorePath(t)
 	c := newClock("2026-11-15T10:00:00Z")
-	h := &fakeHarness{panes: []agents.Pane{
-		pane("p-orphan", "claude", "idle"),
-		pane("p-agent", "claude", "idle"),
-		pane("p-terminal", "", ""),
-	}}
-	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+	rp := &fakeReaper{}
+	w := tierWatcher(b, s, h, rp, c)
+	tr := &captureTrace{}
+	w.Trace = tr
 
-	if _, err := w.Tick(context.Background()); err != nil {
-		t.Fatalf("first tick: %v", err)
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+	b.tasks = []board.Task{claimedTask("t-1", "cap", "p1", 1, false)} // the lease lapsed
+	report := tick(t, w, c, 30*time.Second)
+
+	if len(rp.calls) != 0 {
+		t.Fatalf("reap calls = %v; a lease lapse alone is not a round over", rp.calls)
 	}
-	h.panes = []agents.Pane{
-		pane("p-orphan", "", ""), // its agent ended; its launch row went with the round
-		pane("p-agent", "claude", "idle"),
-		pane("p-terminal", "", ""),
-	}
-	tick(t, w, c, 30*time.Second) // the agent ends; the grace starts now
-	tick(t, w, c, 20*time.Second) // 20 s of grace: under the minute
 	if len(h.closed) != 0 {
-		t.Fatalf("closed %v before the grace elapsed", h.closed)
+		t.Fatalf("cap closed %v; a working agent's pane is never closed", h.closed)
 	}
-	tick(t, w, c, 40*time.Second) // 60 s of grace: the grace has elapsed
-	if len(h.closed) != 1 || h.closed[0] != "p-orphan" {
-		t.Fatalf("closed = %v, want exactly [p-orphan]", h.closed)
+	if len(h.prompts) != 0 {
+		t.Fatalf("prompted %v; a working agent is never prompted", h.prompts)
 	}
-
-	for i := 0; i < 5; i++ {
-		tick(t, w, c, 100*time.Second)
+	if len(report.Actions) != 0 || len(report.Refused) != 0 {
+		t.Fatalf("actions %+v, refused %v; a lease lapse with a working agent does nothing", report.Actions, report.Refused)
 	}
-	if len(h.closed) != 1 {
-		t.Fatalf("closed = %v; a pane that never held an agent is a human terminal", h.closed)
+	if n := len(actionLines(tr)); n != 0 {
+		t.Fatalf("action lines = %d; a tick that decides nothing traces nothing: %v", n, actionLines(tr))
 	}
 }
 
-func TestCloseIsRecordedBeforeItRuns(t *testing.T) {
-	b := &fakeBoard{}
-	s, _ := newStorePath(t)
-	c := newClock("2026-11-15T10:00:00Z")
-	h := &fakeHarness{panes: []agents.Pane{pane("p-orphan", "claude", "idle")}, closeErr: errors.New("cannot close")}
-	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+// D1: when the round is over but the agent is still working, cap records a
+// reap recommendation in the trace and takes no action. The line names the task
+// and the pane, so the trace reads against this test's name.
+func TestD1RoundOverWithWorkingAgentRecommends(t *testing.T) {
+	t.Run("a round that left the board", func(t *testing.T) {
+		task := claimedTask("t-1", "cap", "p1", 1, true)
+		b := &fakeBoard{tasks: []board.Task{task}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+		tr := &captureTrace{}
+		w.Trace = tr
 
-	if _, err := w.Tick(context.Background()); err != nil {
-		t.Fatalf("first tick: %v", err)
-	}
-	h.panes = []agents.Pane{pane("p-orphan", "", "")}
-	tick(t, w, c, 30*time.Second)           // the grace starts
-	report := tick(t, w, c, 70*time.Second) // the grace has elapsed: close, and it fails
-	if len(report.Refused) != 1 || !strings.Contains(report.Refused[0], "failed") {
-		t.Fatalf("refused = %v, want the failed close reported", report.Refused)
-	}
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		b.tasks = nil // the round closed; fs kept the working agent's pane
+		report := tick(t, w, c, 30*time.Second)
 
-	as := actionsIn(t, s, state.CursorScope)
-	var attempted, failed bool
-	for _, a := range as {
-		switch {
-		case a.Outcome == state.ActionAttempted:
-			attempted = true
-		case strings.HasPrefix(a.Outcome, state.ActionFailed):
-			failed = true
+		if len(rp.calls) != 0 {
+			t.Fatalf("reap calls = %v; a working agent is never reaped", rp.calls)
 		}
-	}
-	if !attempted || !failed {
-		t.Fatalf("actions = %+v, want an attempted row and a failed row", as)
-	}
+		if len(h.closed) != 0 {
+			t.Fatalf("cap closed %v; cap never closes a pane", h.closed)
+		}
+		if len(report.Actions) != 0 {
+			t.Fatalf("actions = %+v; a recommendation is not an action", report.Actions)
+		}
+		e := wantActionLine(t, tr, ClassReap)
+		if e["result"] != actionRecommended || e["task"] != "t-1" || e["pane"] != "p1" {
+			t.Fatalf("recommendation = %v, want recommended on t-1 and p1", e)
+		}
+		if !strings.Contains(e["trigger"].(string), "D1") {
+			t.Fatalf("trigger = %q, want it to name D1", e["trigger"])
+		}
+	})
 
-	tick(t, w, c, 30*time.Second) // inside the gate: no retry
-	if len(h.closed) != 1 {
-		t.Fatalf("closed %d times, want one attempt inside the gate", len(h.closed))
-	}
+	t.Run("a review verdict on a task still open", func(t *testing.T) {
+		oldAt, _ := time.Parse(time.RFC3339, "2026-11-15T10:00:00Z")
+		newAt := oldAt.Add(30 * time.Second)
+		rev := claimedTask("t-2", "cap", "p2", 1, true)
+		rev.Kind = "review"
+		rev.Agent = board.Observed{Role: "review", State: "fail", Reported: "fail", At: &oldAt}
+		b := &fakeBoard{tasks: []board.Task{rev}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p2", "claude", "working")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+		tr := &captureTrace{}
+		w.Trace = tr
+
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		rev.Agent.At = &newAt // the verdict just arrived; the agent still works
+		b.tasks = []board.Task{rev}
+		report := tick(t, w, c, 30*time.Second)
+
+		if len(rp.calls) != 0 || len(h.closed) != 0 {
+			t.Fatalf("reap calls = %v, closed = %v; a working agent is left alone", rp.calls, h.closed)
+		}
+		if len(report.Actions) != 0 {
+			t.Fatalf("actions = %+v; a recommendation is not an action", report.Actions)
+		}
+		e := wantActionLine(t, tr, ClassReap)
+		if e["result"] != actionRecommended || e["task"] != "t-2" || e["pane"] != "p2" {
+			t.Fatalf("recommendation = %v, want recommended on t-2 and p2", e)
+		}
+	})
 }
 
 // AC18: a transition into blocked writes one question and one notification,
@@ -597,7 +669,7 @@ func TestN5UnreadableHarnessSkipsTierOne(t *testing.T) {
 	b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
 	s, _ := newStorePath(t)
 	c := newClock("2026-11-15T10:00:00Z")
-	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
 	tr := &captureTrace{}
 	rp := &fakeReaper{}
 	w := tierWatcher(b, s, h, rp, c)
@@ -716,7 +788,7 @@ func TestAC20TierOneDecisionsAreTraced(t *testing.T) {
 		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
 		s, _ := newStorePath(t)
 		c := newClock("2026-11-15T10:00:00Z")
-		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
 		w := tierWatcher(b, s, h, &fakeReaper{}, c)
 		tr := &captureTrace{}
 		w.Trace = tr
@@ -731,25 +803,22 @@ func TestAC20TierOneDecisionsAreTraced(t *testing.T) {
 		}
 	})
 
-	t.Run("close", func(t *testing.T) {
-		b := &fakeBoard{}
+	t.Run("reap recommendation", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
 		s, _ := newStorePath(t)
 		c := newClock("2026-11-15T10:00:00Z")
-		h := &fakeHarness{panes: []agents.Pane{pane("p-orphan", "claude", "idle")}}
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
 		w := tierWatcher(b, s, h, &fakeReaper{}, c)
 		tr := &captureTrace{}
 		w.Trace = tr
 
-		if _, err := w.Tick(context.Background()); err != nil {
-			t.Fatalf("first tick: %v", err)
-		}
-		h.panes = []agents.Pane{pane("p-orphan", "", "")}
-		tick(t, w, c, 30*time.Second) // the agent ends; the grace starts
-		tick(t, w, c, 61*time.Second) // the grace elapsed: close
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		b.tasks = nil // the round closed while the agent was still working
+		tick(t, w, c, 30*time.Second)
 
-		e := wantActionLine(t, tr, ClassClose)
-		if e["result"] != state.ActionDone || e["target"] != "p-orphan" || e["pane"] != "p-orphan" {
-			t.Fatalf("close line = %v, want done on the pane", e)
+		e := wantActionLine(t, tr, ClassReap)
+		if e["result"] != actionRecommended || e["task"] != "t-1" || e["pane"] != "p1" {
+			t.Fatalf("reap line = %v, want a recommendation naming the task and pane", e)
 		}
 	})
 
@@ -1005,7 +1074,7 @@ func TestAC22TheTickInformsTheClaimHolder(t *testing.T) {
 		b := &fakeBoard{tasks: []board.Task{task}}
 		s, _ := newStorePath(t)
 		c := newClock("2026-11-15T10:00:00Z")
-		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working"), pane("p9", "claude", "idle")}}
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle"), pane("p9", "claude", "idle")}}
 		w := tierWatcher(b, s, h, &fakeReaper{}, c)
 		seedCursor(t, s, c.at, b.tasks, h.panes)
 		b.tasks = nil

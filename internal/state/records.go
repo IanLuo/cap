@@ -49,18 +49,13 @@ type Cursor struct {
 	Panes []CursorPane `json:"panes,omitempty"`
 }
 
-// CursorPane is one pane's comparison fields: the agent it runs, its state, the
-// tick it was first seen in that class, and whether it has ever run an agent.
-// First anchors the close grace period, so a pane is never closed on elapsed
-// time alone. WasAgent marks an orphan: a pane that held an agent and lost it.
-// A pane that never held one is a human terminal, never cap's to close.
+// CursorPane is one pane's comparison fields: the agent it runs and its state.
+// Comparing it with the next harness read is what makes a transition visible.
 type CursorPane struct {
-	Pane     string    `json:"pane"`
-	Agent    string    `json:"agent,omitempty"`
-	Status   string    `json:"status"`
-	CWD      string    `json:"cwd,omitempty"`
-	First    time.Time `json:"first"`
-	WasAgent bool      `json:"was_agent,omitempty"`
+	Pane   string `json:"pane"`
+	Agent  string `json:"agent,omitempty"`
+	Status string `json:"status"`
+	CWD    string `json:"cwd,omitempty"`
 }
 
 // Action is one tier-1 act: what cap did without an instruction, why, to what,
