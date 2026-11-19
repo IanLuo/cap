@@ -282,12 +282,14 @@ func (e *engine) postToasts(informed bool) {
 	}
 }
 
-// inform tells the live claim holder what this tick saw: one prompt, one line
+// inform tells the claim holder what this tick saw: one prompt, one line
 // per event, each naming its kind, project and task by goal. It is the one
 // message on the clock path addressed to a session. It returns true only when
 // the prompt was sent, so the toasts know whether to stand down. It reports; it
 // never instructs, never answers a blocked agent (so it never prompts a pane
 // the harness shows as blocked), and never changes what an action does.
+// The lease gates the write verbs, not this address: a lapsed claim still names
+// where its holder lives, until a takeover writes a new one.
 func (e *engine) inform(paneByID map[string]agents.Pane) bool {
 	if len(e.events) == 0 {
 		return false
@@ -297,7 +299,7 @@ func (e *engine) inform(paneByID map[string]agents.Pane) bool {
 		e.err = err
 		return false
 	}
-	if claim == nil || claim.Pane == "" || !claim.Live(e.now) {
+	if claim == nil || claim.Pane == "" {
 		return false
 	}
 	p, listed := paneByID[claim.Pane]

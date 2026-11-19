@@ -1083,12 +1083,15 @@ func TestAC22TheTickInformsTheClaimHolder(t *testing.T) {
 		}
 	})
 
-	t.Run("stale claim", func(t *testing.T) {
+	t.Run("a lapsed claim still receives", func(t *testing.T) {
 		h, s, w, c := finished(t)
 		seedClaim(t, s, "s-coord", "p9", c.at.Add(-time.Minute))
 		tick(t, w, c, 30*time.Second)
-		if len(h.prompts) != 0 {
-			t.Fatalf("prompts = %v; a stale claim has no address", h.prompts)
+		if len(h.prompts) != 1 {
+			t.Fatalf("prompts = %v; the lease gates the verbs, not the address", h.prompts)
+		}
+		if len(h.notified) != 0 {
+			t.Fatalf("notifications = %v; the holder was informed", h.notified)
 		}
 	})
 
