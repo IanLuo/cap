@@ -433,6 +433,7 @@ func usage(w io.Writer) {
 
   --json              one JSON object per call, one per tick for watch
   --session S         the caller's identity (default $CAP_SESSION)
+  --pane P            the caller's pane id; the tick reports its actions here
   --confirm           take an unclaimed or stale cap; the user must agree first
 
 The board comes from "fs status" only, and the agent view from "herdr pane

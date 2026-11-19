@@ -69,6 +69,7 @@ func isolated(t *testing.T) {
 	t.Helper()
 	t.Setenv("MEMSTORE_DB", filepath.Join(t.TempDir(), "memory.db"))
 	t.Setenv("CAP_SESSION", "test")
+	t.Setenv("HERDR_PANE_ID", "")
 }
 
 func TestStatusJSONReportsRunning(t *testing.T) {

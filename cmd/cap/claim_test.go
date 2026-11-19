@@ -294,6 +294,7 @@ func TestClaimJSON(t *testing.T) {
 func TestClaimRecordsTheHoldersPane(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "memory.db")
 	t.Setenv("MEMSTORE_DB", dbPath)
+	t.Setenv("HERDR_PANE_ID", "")
 
 	var out, errOut bytes.Buffer
 	if code := run([]string{"claim", "--session", "coord", "--pane", "w9:p3", "--confirm"}, &out, &errOut); code != 0 {
@@ -327,5 +328,39 @@ func TestClaimRecordsTheHoldersPane(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "w9:p3") {
 		t.Fatalf("stdout = %q, want the pane named", out.String())
+	}
+}
+
+// AC19: the address defaults to the pane the harness started the caller in,
+// so a caller never has to ask herdr for its own id. --pane still wins.
+func TestClaimDefaultsThePaneFromTheHarnessEnv(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "memory.db")
+	t.Setenv("MEMSTORE_DB", dbPath)
+
+	t.Setenv("HERDR_PANE_ID", "w1B:p2")
+	var out, errOut bytes.Buffer
+	if code := run([]string{"claim", "--session", "coord", "--confirm"}, &out, &errOut); code != 0 {
+		t.Fatalf("claim exit = %d, stderr %s", code, errOut.String())
+	}
+	c, err := state.DecodeClaim(claimRowList(t, dbPath)[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pane != "w1B:p2" {
+		t.Fatalf("claim pane = %q, want the harness pane w1B:p2", c.Pane)
+	}
+
+	// An explicit --pane wins over the environment.
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"claim", "--session", "coord", "--pane", "w9:p4"}, &out, &errOut); code != 0 {
+		t.Fatalf("claim exit = %d, stderr %s", code, errOut.String())
+	}
+	c, err = state.DecodeClaim(claimRowList(t, dbPath)[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pane != "w9:p4" {
+		t.Fatalf("claim pane = %q; --pane must override the environment", c.Pane)
 	}
 }

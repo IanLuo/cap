@@ -31,7 +31,7 @@ nix build .
 ```
 
 - Tests use a temporary memstore file plus fake board, fake harness and fake reaper. They need no herdr, no network, and never touch the real board.
-- `MEMSTORE_DB` names the store (default `~/.memstore/memory.db`). `CAP_FS_BIN` names the fs binary (default `fs`). `CAP_HERDR_BIN` names the harness binary (default `herdr`). `CAP_TRACE` names the trace file (default `~/.cap/trace.log`). `CAP_SESSION` is the caller's identity for the claim; `--session` overrides it.
+- `MEMSTORE_DB` names the store (default `~/.memstore/memory.db`). `CAP_FS_BIN` names the fs binary (default `fs`). `CAP_HERDR_BIN` names the harness binary (default `herdr`). `CAP_TRACE` names the trace file (default `~/.cap/trace.log`). `CAP_SESSION` is the caller's identity for the claim; `--session` overrides it. `HERDR_PANE_ID`, set by herdr in every pane, is the caller's address; `cap claim` records it unless `--pane` names another.
 - `nix develop` is required: `go` is not on the host PATH.
 
 ## Hot invariants

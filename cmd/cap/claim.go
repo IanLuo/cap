@@ -68,6 +68,23 @@ func writeClaim(store *state.MemStore, cur *state.Claim, session, pane string, n
 	return nil
 }
 
+// claimPane names the holder's address: --pane first, then the pane the
+// harness started this caller in ($HERDR_PANE_ID), then the pane the same
+// session's open claim already records. cap reads the harness's variable so a
+// caller never has to ask herdr for its own id.
+func claimPane(o options, cur *state.Claim, session string) string {
+	if o.pane != "" {
+		return o.pane
+	}
+	if p := os.Getenv("HERDR_PANE_ID"); p != "" {
+		return p
+	}
+	if cur != nil && cur.Session == session {
+		return cur.Pane
+	}
+	return ""
+}
+
 // claimCmd takes or renews the claim. An unclaimed or stale cap needs
 // --confirm: the claim is a takeover, and the user's yes is what makes it one.
 func claimCmd(o options, stdout, stderr io.Writer) int {
@@ -90,11 +107,8 @@ func claimCmd(o options, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "cap: %s\n", reason)
 		return 1
 	}
-	// --pane sets the address; a rename without one keeps the holder's.
-	pane := o.pane
-	if pane == "" && cur != nil && cur.Session == session {
-		pane = cur.Pane
-	}
+	// The address: --pane, else the harness's pane id, else the holder's own.
+	pane := claimPane(o, cur, session)
 	if err := writeClaim(store, cur, session, pane, now); err != nil {
 		fmt.Fprintf(stderr, "cap: %v\n", err)
 		return 1
