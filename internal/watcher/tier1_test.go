@@ -1370,7 +1370,7 @@ func doneDev(t board.Task) board.Task {
 
 // callerRound builds a watcher where dev task t-1 has just closed and the pane
 // fs named as its caller is p2, owned by t-9, a second fs-launched task still
-// on the board. An fs launch row owns p2, which is what makes it addressable.
+// on the board. p2 answers one prompt per tick.
 func callerRound(t *testing.T, caller string) (*Watcher, *fakeHarness, state.Store, *clock, *captureTrace) {
 	t.Helper()
 	open := claimedTask("t-1", "cap", "p1", 1, false)
@@ -1535,23 +1535,24 @@ func TestD3TheCallerIsNotTheLaunchedPane(t *testing.T) {
 	}
 }
 
-// D2: a pane no fs launch row owns is the user's, never an address. The toast
-// carries the news instead.
-func TestD3TheCallerPaneMustBeOwned(t *testing.T) {
+// D2 exception, AC22: a caller pane no launch row owns is still the task's
+// dispatcher. fs recorded it from the pane's own environment at dispatch, so the
+// news may address it; cap only never closes or claims that pane.
+func TestD3TheCallerPaneNeedNotBeOwned(t *testing.T) {
 	w, h, _, c, tr := callerRound(t, "p3")
 	h.panes = append(h.panes, pane("p3", "claude", "idle"))
 
 	tick(t, w, c, 30*time.Second)
 
-	if len(h.prompts) != 0 {
-		t.Fatalf("prompts = %v; no launch row owns p3", h.prompts)
+	if len(h.prompts) != 1 || !strings.HasPrefix(h.prompts[0], "p3: ") {
+		t.Fatalf("prompts = %v; the caller pane is the dispatcher, owned or not", h.prompts)
 	}
-	if len(h.notified) != 1 {
-		t.Fatalf("notifications = %v, want the toast fallback", h.notified)
+	if len(h.notified) != 0 {
+		t.Fatalf("notifications = %v; the dispatcher was told", h.notified)
 	}
-	line := wantPathLine(t, tr, "toast")
-	if !strings.Contains(line["why"].(string), "launch row") {
-		t.Fatalf("announcement line = %v, want the ownership reason", line)
+	line := wantPathLine(t, tr, "caller")
+	if line["result"] != state.ActionDone || line["pane"] != "p3" {
+		t.Fatalf("announcement line = %v, want done on pane p3", line)
 	}
 }
 
@@ -1604,8 +1605,9 @@ func TestD3ARecordedRoundIsNotAnnouncedAgain(t *testing.T) {
 	}
 }
 
-// D3, one voice: when the caller is the claim holder, the tick's inform carries
-// the news to that pane and the announce adds no second prompt.
+// D3, one voice: when the caller is also the claim holder, the tick prompts
+// that pane once — with the round announcement, which names the commit — and
+// the inform adds no second line for the same round.
 func TestD3TheCallerWhoIsTheHolderIsToldOnce(t *testing.T) {
 	w, h, s, c, tr := callerRound(t, "p2")
 	seedClaim(t, s, "s-coord", "p2", c.at.Add(state.ClaimLease))
@@ -1613,17 +1615,20 @@ func TestD3TheCallerWhoIsTheHolderIsToldOnce(t *testing.T) {
 	tick(t, w, c, 30*time.Second)
 
 	if len(h.prompts) != 1 {
-		t.Fatalf("prompts = %v, want the holder's one inform prompt", h.prompts)
+		t.Fatalf("prompts = %v, want one announcement prompt", h.prompts)
 	}
-	if !strings.Contains(h.prompts[0], "finished") {
-		t.Fatalf("prompt = %q, want the holder's event line, not a second announcement", h.prompts[0])
+	if !strings.Contains(h.prompts[0], "round closed") || !strings.Contains(h.prompts[0], "abc1234") {
+		t.Fatalf("prompt = %q, want the round announcement with its commit", h.prompts[0])
+	}
+	if strings.Contains(h.prompts[0], "finished") {
+		t.Fatalf("prompt = %q; the announcement already carried the round", h.prompts[0])
 	}
 	if len(h.notified) != 0 {
 		t.Fatalf("notifications = %v; the holder was told", h.notified)
 	}
-	line := wantPathLine(t, tr, "holder")
+	line := wantPathLine(t, tr, "caller")
 	if line["result"] != state.ActionDone || line["pane"] != "p2" {
-		t.Fatalf("announcement line = %v, want done naming the holder's pane", line)
+		t.Fatalf("announcement line = %v, want done naming the caller's pane", line)
 	}
 }
 
@@ -1644,5 +1649,146 @@ func TestD3AFailedCallerPromptFallsBackToTheToast(t *testing.T) {
 	line := wantPathLine(t, tr, "caller")
 	if !strings.HasPrefix(line["result"].(string), state.ActionFailed) {
 		t.Fatalf("announcement line = %v, want a failed result", line)
+	}
+}
+
+// AC22: a blocked agent's news goes to the pane fs recorded as its task's
+// caller, with no claim at all. The dispatcher is the address; the claim is
+// only the fallback.
+func TestAC22TheDispatcherIsToldWithNoClaim(t *testing.T) {
+	task := claimedTask("t-1", "cap", "p1", 1, true)
+	task.Goal = "reach the dispatcher"
+	task.Process.CallerPane = "p2"
+	b := &fakeBoard{tasks: []board.Task{task}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle"), pane("p2", "claude", "idle")}}
+	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+
+	h.panes = []agents.Pane{pane("p1", "claude", "blocked"), pane("p2", "claude", "idle")}
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 1 || !strings.HasPrefix(h.prompts[0], "p2: ") {
+		t.Fatalf("prompts = %v, want one to the dispatcher's pane p2", h.prompts)
+	}
+	if !strings.Contains(h.prompts[0], `"reach the dispatcher"`) {
+		t.Fatalf("prompt = %q, want the task named by goal", h.prompts[0])
+	}
+	if len(h.notified) != 0 {
+		t.Fatalf("notifications = %v; the dispatcher was told", h.notified)
+	}
+}
+
+// AC22: two tasks with two dispatchers send two prompts, each carrying only its
+// own task's lines.
+func TestAC22TwoDispatchersGetTwoPrompts(t *testing.T) {
+	one := claimedTask("t-1", "cap", "p1", 1, true)
+	one.Goal = "first goal"
+	one.Process.CallerPane = "p2"
+	two := claimedTask("t-2", "cap", "p3", 1, true)
+	two.Goal = "second goal"
+	two.Process.CallerPane = "p4"
+	b := &fakeBoard{tasks: []board.Task{one, two}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle"), pane("p2", "claude", "idle"), pane("p3", "claude", "idle"), pane("p4", "claude", "idle")}}
+	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+
+	h.panes = []agents.Pane{pane("p1", "claude", "blocked"), pane("p2", "claude", "idle"), pane("p3", "claude", "blocked"), pane("p4", "claude", "idle")}
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 2 {
+		t.Fatalf("prompts = %v, want one per dispatcher", h.prompts)
+	}
+	byPane := map[string]string{}
+	for _, p := range h.prompts {
+		id, text, ok := strings.Cut(p, ": ")
+		if !ok {
+			t.Fatalf("prompt = %q, want a pane prefix", p)
+		}
+		byPane[id] = text
+	}
+	if !strings.Contains(byPane["p2"], "first goal") || strings.Contains(byPane["p2"], "second goal") {
+		t.Fatalf("pane p2 got %q, want only its own event", byPane["p2"])
+	}
+	if !strings.Contains(byPane["p4"], "second goal") || strings.Contains(byPane["p4"], "first goal") {
+		t.Fatalf("pane p4 got %q, want only its own event", byPane["p4"])
+	}
+}
+
+// AC22: a dispatcher the harness cannot take a prompt in — unlisted here — is
+// replaced by the claim's pane.
+func TestAC22AnUnusableDispatcherFallsBackToTheClaim(t *testing.T) {
+	task := claimedTask("t-1", "cap", "p1", 1, true)
+	task.Goal = "reach the dispatcher"
+	task.Process.CallerPane = "p8"
+	b := &fakeBoard{tasks: []board.Task{task}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle"), pane("p9", "claude", "idle")}}
+	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+	seedClaim(t, s, "s-coord", "p9", c.at.Add(state.ClaimLease))
+
+	h.panes = []agents.Pane{pane("p1", "claude", "blocked"), pane("p9", "claude", "idle")}
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 1 || !strings.HasPrefix(h.prompts[0], "p9: ") {
+		t.Fatalf("prompts = %v, want the claim's pane p9 as the fallback", h.prompts)
+	}
+}
+
+// AC22: a caller pane equal to the launched pane is the same agent talking to
+// itself, so the claim's pane is the address.
+func TestAC22TheCallerIsNotTheLaunchedPane(t *testing.T) {
+	task := claimedTask("t-1", "cap", "p1", 1, true)
+	task.Goal = "reach the dispatcher"
+	task.Process.CallerPane = "p1"
+	b := &fakeBoard{tasks: []board.Task{task}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle"), pane("p9", "claude", "idle")}}
+	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+	seedClaim(t, s, "s-coord", "p9", c.at.Add(state.ClaimLease))
+
+	h.panes = []agents.Pane{pane("p1", "claude", "blocked"), pane("p9", "claude", "idle")}
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 1 || !strings.HasPrefix(h.prompts[0], "p9: ") {
+		t.Fatalf("prompts = %v, want the claim's pane p9", h.prompts)
+	}
+}
+
+// AC22: a blocked reviewer verdict goes to the pane that dispatched the review
+// — its dev worker — not to the claim holder.
+func TestAC22ABlockedVerdictGoesToTheReviewsDispatcher(t *testing.T) {
+	dev := claimedTask("t-1", "cap", "p1", 1, true)
+	dev.Goal = "logging standard"
+	review := claimedTask("t-2", "cap", "p3", 1, true)
+	review.Kind = "review"
+	review.Goal = "review the logging change"
+	review.Process.CallerPane = "p1"
+	b := &fakeBoard{tasks: []board.Task{dev, review}}
+	s, _ := newStorePath(t)
+	c := newClock("2026-11-15T10:00:00Z")
+	h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle"), pane("p3", "claude", "idle"), pane("p9", "claude", "idle")}}
+	w := tierWatcher(b, s, h, &fakeReaper{}, c)
+	seedCursor(t, s, c.at, b.tasks, h.panes)
+	seedClaim(t, s, "s-coord", "p9", c.at.Add(state.ClaimLease))
+
+	verdict := review
+	at := c.at.Add(5 * time.Second)
+	verdict.Agent = board.Observed{State: "blocked", Reported: "blocked", Role: "review", At: &at}
+	b.tasks = []board.Task{dev, verdict}
+	tick(t, w, c, 30*time.Second)
+
+	if len(h.prompts) != 1 || !strings.HasPrefix(h.prompts[0], "p1: ") {
+		t.Fatalf("prompts = %v, want the review's dispatcher p1", h.prompts)
+	}
+	if !strings.Contains(h.prompts[0], "review blocked cap:") || !strings.Contains(h.prompts[0], `"review the logging change"`) {
+		t.Fatalf("prompt = %q, want the blocked verdict named by goal", h.prompts[0])
 	}
 }
