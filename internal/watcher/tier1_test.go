@@ -118,6 +118,22 @@ func seedNudge(t *testing.T, s state.Store, task string, round int, at time.Time
 	}
 }
 
+// seedReap writes a finished reap for a project, as an earlier tick would have
+// left it: the 90 s gate reads it.
+func seedReap(t *testing.T, s state.Store, project string, at time.Time) {
+	t.Helper()
+	text, err := state.Encode(state.Action{
+		Class: ClassReap, Target: project, Project: project,
+		Trigger: "seeded", At: at, Outcome: state.ActionDone,
+	})
+	if err != nil {
+		t.Fatalf("encode reap: %v", err)
+	}
+	if _, err := s.Put(state.KindAction, state.Scope(project), "reap "+project, text); err != nil {
+		t.Fatalf("seed reap: %v", err)
+	}
+}
+
 // seedCursor writes the cursor a previous tick would have left: the open board
 // and the harness snapshot it saw. The next tick compares against it, so no
 // baseline reap runs and no earlier action closes the gate.
@@ -357,6 +373,55 @@ func TestAC15OneActionPerClassInGate(t *testing.T) {
 	if len(second.Refused) != 1 || !strings.Contains(second.Refused[0], "earlier action at") {
 		t.Fatalf("refused = %v, want one refusal naming the earlier action", second.Refused)
 	}
+}
+
+// AC15's one exception: the harness-transition reap of a round the board shows
+// as over runs even when an earlier reap for the project is inside the gate.
+// Every other reap stays gated.
+func TestAC15TheTransitionReapIsExemptFromTheGate(t *testing.T) {
+	t.Run("the transition reap", func(t *testing.T) {
+		done := claimedTask("t-1", "cap", "p1", 1, false)
+		done.State = "done"
+		b := &fakeBoard{tasks: []board.Task{done}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "working")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		seedReap(t, s, "cap", c.at)
+
+		h.panes = []agents.Pane{pane("p1", "claude", "idle")}
+		report := tick(t, w, c, 30*time.Second)
+
+		if len(rp.calls) != 1 || rp.calls[0] != "cap" {
+			t.Fatalf("reap calls = %v, want exactly [cap]: the transition reap is exempt from the gate", rp.calls)
+		}
+		if len(report.Refused) != 0 {
+			t.Fatalf("refused = %v, want none", report.Refused)
+		}
+	})
+
+	t.Run("the closed-round reap stays gated", func(t *testing.T) {
+		b := &fakeBoard{tasks: []board.Task{claimedTask("t-1", "cap", "p1", 1, true)}}
+		s, _ := newStorePath(t)
+		c := newClock("2026-11-15T10:00:00Z")
+		h := &fakeHarness{panes: []agents.Pane{pane("p1", "claude", "idle")}}
+		rp := &fakeReaper{}
+		w := tierWatcher(b, s, h, rp, c)
+		seedCursor(t, s, c.at, b.tasks, h.panes)
+		seedReap(t, s, "cap", c.at)
+
+		b.tasks = nil // the round closes; the agent is already idle
+		report := tick(t, w, c, 30*time.Second)
+
+		if len(rp.calls) != 0 {
+			t.Fatalf("reap calls = %v; inside the gate, the closed-round reap is refused", rp.calls)
+		}
+		if len(report.Refused) != 1 || !strings.Contains(report.Refused[0], "earlier action at") {
+			t.Fatalf("refused = %v, want one refusal naming the earlier action", report.Refused)
+		}
+	})
 }
 
 // AC16: a claimed task with a lapsed lease and an idle agent is nudged with its

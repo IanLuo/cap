@@ -111,7 +111,7 @@ func (w *Watcher) tier1(ctx context.Context, old *state.Cursor, tasks []board.Ta
 		// working, the harness transition is the trigger to ask fs again: fs
 		// closes an idle agent whose round is over. cap never closes the pane.
 		if !e.spoken[t.Task] && transition && prev.Status == "working" && p.Status != "working" && roundOver(t) {
-			e.reapOnce(t.Project, "pane "+p.ID+" stopped working, round over on task "+t.Task)
+			e.reapOnceUngated(t.Project, "pane "+p.ID+" stopped working, round over on task "+t.Task)
 		}
 		switch p.Status {
 		case "blocked":
@@ -204,16 +204,34 @@ type toast struct {
 // reapOnce is the one reap cap takes for a project in a tick, whichever
 // transition led to it. The 90 s gate still holds across ticks.
 func (e *engine) reapOnce(project, why string) {
+	e.reap(project, why, false)
+}
+
+// reapOnceUngated is the harness-transition reap, the one action AC15 exempts
+// from the gate: the board's reap left a working agent in place, and this
+// transition is the retry that finishes the round. The transition is its own
+// bound: at most one attempt per pane moved out of working.
+func (e *engine) reapOnceUngated(project, why string) {
+	e.reap(project, why, true)
+}
+
+func (e *engine) reap(project, why string, ungated bool) {
 	if e.w.Reap == nil || e.reaped[project] {
 		return
 	}
 	e.reaped[project] = true
-	e.perform(state.Action{
+	a := state.Action{
 		Class:   ClassReap,
 		Target:  project,
 		Project: project,
 		Trigger: why,
-	}, func() error { return e.w.Reap.Reap(e.ctx, project) })
+	}
+	run := func() error { return e.w.Reap.Reap(e.ctx, project) }
+	if ungated {
+		e.performUngated(a, run)
+		return
+	}
+	e.perform(a, run)
 }
 
 // reapBaseline is the first observation's one act: one fs reap for every
@@ -778,8 +796,9 @@ func (e *engine) perform(a state.Action, run func() error) {
 	e.runAction(a, run)
 }
 
-// performUngated is perform without the 90 s gate. The inform needs no gate of
-// its own: a tick sends at most one, and only when it saw an event.
+// performUngated is perform without the 90 s gate. Two callers have a bound of
+// their own: the inform sends at most one prompt per tick, and the
+// harness-transition reap runs at most once per transition (AC15).
 func (e *engine) performUngated(a state.Action, run func() error) bool {
 	return e.runAction(a, run)
 }
